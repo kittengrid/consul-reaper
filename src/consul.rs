@@ -67,8 +67,8 @@ pub struct CatalogRegistration {
     #[serde(rename = "Node")]
     node: String,
 
-    #[serde(rename = "Address")]
-    address: String,
+    #[serde(rename = "Address", skip_serializing_if = "Option::is_none")]
+    address: Option<String>,
 
     #[serde(rename = "Datacenter", skip_serializing_if = "Option::is_none")]
     datacenter: Option<String>,
@@ -81,6 +81,9 @@ pub struct CatalogRegistration {
 
     #[serde(rename = "Service", skip_serializing_if = "Option::is_none")]
     service: Option<ServiceDefinition>,
+
+    #[serde(rename = "SkipNodeUpdate", skip_serializing_if = "Option::is_none")]
+    skip_node_update: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -113,12 +116,13 @@ impl From<Node> for CatalogRegistration {
     fn from(node: Node) -> Self {
         Self {
             node: node.name,
-            address: node.address,
+            address: Some(node.address),
             datacenter: node.datacenter,
             node_meta: node.node_meta,
             service: None,
             tagged_addresses: node.tagged_addresses,
             id: node.id,
+            skip_node_update: None,
         }
     }
 }
@@ -501,7 +505,7 @@ mod tests {
         });
 
         assert_eq!(registration.node, "test-node");
-        assert_eq!(registration.address, "192.168.1.100");
+        assert_eq!(registration.address, Some("192.168.1.100".to_string()));
         assert_eq!(registration.datacenter, Some("dc1".to_string()));
         assert!(registration.node_meta.is_some());
         assert!(registration.service.is_some());
@@ -738,6 +742,61 @@ mod tests {
             .register_node(modified_node.clone().into())
             .await
             .unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_watch_updated_nodes_becasue_of_a_service_registered() {
+        let consul = Consul::new("localhost", 8500);
+        let mut stream = consul.watch_nodes("");
+
+        // Create a task to wait for the new node
+        let node = random_node();
+        let expected_updated_node_name = node.name.clone();
+
+        consul.register_node(node.clone().into()).await.unwrap();
+
+        let task = tokio::spawn(async move {
+            loop {
+                // Wait for the next node in the stream
+                tokio::select! {
+                    Some(node_event) = stream.next() => {
+                        match node_event {
+                            NodeEvent::Updated(updated_node) => {
+                                if updated_node.name == expected_updated_node_name {
+                                    assert_eq!(updated_node.name, expected_updated_node_name);
+                                    break;
+                                }
+                            },
+                            NodeEvent::Added(_)|NodeEvent::Removed(_) => { },
+                            NodeEvent::Error(err) => {
+                                panic!("Stream error: {}", err);
+                            },
+                        }
+                    }
+                    else => break,
+                }
+            }
+        });
+
+        sleep(Duration::from_millis(100)).await;
+
+        let catalog_registration = CatalogRegistration {
+            id: None,
+            address: Some(node.address.clone()),
+            datacenter: None,
+            tagged_addresses: None,
+            node_meta: None,
+            node: node.name.clone(),
+            service: Some(ServiceDefinition {
+                Service: "web".to_string(),
+                Port: 8080,
+                Tags: Some(vec!["http".to_string(), "api".to_string()]),
+            }),
+            skip_node_update: None,
+        };
+
+        consul.register_node(catalog_registration).await.unwrap();
         task.await.unwrap();
     }
 }
