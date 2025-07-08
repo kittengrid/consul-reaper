@@ -1,0 +1,747 @@
+use futures::stream::{self, Stream};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::collections::VecDeque;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+use std::pin::Pin;
+use std::time::Duration;
+use tokio::time::sleep;
+
+#[derive(Debug, Clone)]
+pub struct Consul {
+    host: String,
+    port: u16,
+    client: Client,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+struct ServiceDefinition {
+    Service: String,
+    Port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    Tags: Option<Vec<String>>,
+}
+
+#[derive(Default, Debug, Deserialize, Clone, PartialEq, Eq)]
+pub struct Node {
+    #[serde(rename = "ID", skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+
+    #[serde(rename = "Node")]
+    name: String,
+
+    #[serde(rename = "Address")]
+    address: String,
+
+    #[serde(rename = "Datacenter", skip_serializing_if = "Option::is_none")]
+    datacenter: Option<String>,
+
+    #[serde(rename = "Meta", skip_serializing_if = "Option::is_none")]
+    node_meta: Option<std::collections::HashMap<String, String>>,
+
+    #[serde(rename = "TaggedAddresses", skip_serializing_if = "Option::is_none")]
+    tagged_addresses: Option<std::collections::HashMap<String, String>>,
+
+    #[serde(rename = "CreateIndex")]
+    created_index: u64,
+
+    #[serde(rename = "ModifyIndex")]
+    modify_index: u64,
+}
+
+impl std::hash::Hash for Node {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct CatalogRegistration {
+    #[serde(rename = "ID", skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+
+    #[serde(rename = "Node")]
+    node: String,
+
+    #[serde(rename = "Address")]
+    address: String,
+
+    #[serde(rename = "Datacenter", skip_serializing_if = "Option::is_none")]
+    datacenter: Option<String>,
+
+    #[serde(rename = "TaggedAddresses", skip_serializing_if = "Option::is_none")]
+    tagged_addresses: Option<std::collections::HashMap<String, String>>,
+
+    #[serde(rename = "NodeMeta", skip_serializing_if = "Option::is_none")]
+    node_meta: Option<std::collections::HashMap<String, String>>,
+
+    #[serde(rename = "Service", skip_serializing_if = "Option::is_none")]
+    service: Option<ServiceDefinition>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CatalogDeregistration {
+    #[serde(rename = "Node")]
+    node: String,
+
+    #[serde(rename = "Datacenter", skip_serializing_if = "Option::is_none")]
+    datacenter: Option<String>,
+
+    #[serde(rename = "CheckID", skip_serializing_if = "Option::is_none")]
+    check_id: Option<String>,
+
+    #[serde(rename = "ServiceID", skip_serializing_if = "Option::is_none")]
+    service_id: Option<String>,
+}
+
+impl From<Node> for CatalogDeregistration {
+    fn from(node: Node) -> Self {
+        Self {
+            node: node.name,
+            datacenter: node.datacenter,
+            check_id: None,
+            service_id: None,
+        }
+    }
+}
+
+impl From<Node> for CatalogRegistration {
+    fn from(node: Node) -> Self {
+        Self {
+            node: node.name,
+            address: node.address,
+            datacenter: node.datacenter,
+            node_meta: node.node_meta,
+            service: None,
+            tagged_addresses: node.tagged_addresses,
+            id: node.id,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StreamState {
+    consul: Consul,
+    last_index: String,
+    known_nodes: HashSet<Node>,
+    pending_added_nodes: VecDeque<Node>,
+    pending_deleted_nodes: VecDeque<Node>,
+    pending_updated_nodes: VecDeque<Node>,
+    node_versions: HashMap<String, u64>,
+    filter: String,
+}
+
+pub enum NodeEvent {
+    Added(Node),
+    Removed(Node),
+    Updated(Node),
+    Error(String),
+}
+
+impl Consul {
+    /// Returns a new instance of the Consul client.
+    pub fn new(host: &str, port: u16) -> Self {
+        Self {
+            host: host.to_string(),
+            port,
+            client: Client::new(),
+        }
+    }
+
+    /// A tokio::stream that will return new nodes as they are registered in Consul.
+    pub fn watch_nodes(&self, filter: &str) -> Pin<Box<dyn Stream<Item = NodeEvent> + Send>> {
+        let state = StreamState {
+            consul: self.clone(),
+            last_index: "0".to_string(),
+            known_nodes: HashSet::new(),
+            pending_added_nodes: VecDeque::new(),
+            pending_deleted_nodes: VecDeque::new(),
+            pending_updated_nodes: VecDeque::new(),
+            node_versions: HashMap::new(),
+            filter: filter.to_string(),
+        };
+
+        Box::pin(stream::unfold(
+            Arc::new(Mutex::new(state)),
+            |state| async move {
+                let mut state_guard = state.lock().await;
+
+                loop {
+                    if let Some(event) = Self::handle_pending_nodes(&mut state_guard, &state) {
+                        return Some(event);
+                    }
+
+                    match Self::fetch_nodes_from_consul(&mut state_guard).await {
+                        Ok(nodes) => {
+                            if let Some(event) =
+                                Self::process_node_changes(&mut state_guard, nodes, &state)
+                            {
+                                return Some(event);
+                            }
+                            sleep(Duration::from_secs(1)).await;
+                        }
+                        Err(e) => {
+                            return Some((e, state.clone()));
+                        }
+                    }
+                }
+            },
+        ))
+    }
+
+    fn handle_pending_nodes(
+        state: &mut StreamState,
+        state_arc: &Arc<Mutex<StreamState>>,
+    ) -> Option<(NodeEvent, Arc<Mutex<StreamState>>)> {
+        if let Some(node) = state.pending_added_nodes.pop_front() {
+            state.known_nodes.insert(node.clone());
+            state
+                .node_versions
+                .insert(node.name.clone(), node.modify_index);
+            return Some((NodeEvent::Added(node), state_arc.clone()));
+        }
+        if let Some(node) = state.pending_deleted_nodes.pop_front() {
+            state.known_nodes.remove(&node);
+            state.node_versions.remove(&node.name);
+            return Some((NodeEvent::Removed(node), state_arc.clone()));
+        }
+        if let Some(node) = state.pending_updated_nodes.pop_front() {
+            state.known_nodes.remove(&node);
+            *state
+                .node_versions
+                .entry(node.name.clone())
+                .or_insert(node.modify_index) = node.modify_index;
+            state.known_nodes.insert(node.clone());
+            return Some((NodeEvent::Updated(node), state_arc.clone()));
+        }
+        None
+    }
+
+    async fn fetch_nodes_from_consul(state: &mut StreamState) -> Result<Vec<Node>, NodeEvent> {
+        let response = state
+            .consul
+            .get("/v1/catalog/nodes?{}")
+            .query(&[
+                ("wait", "5s"),
+                ("index", &state.last_index),
+                ("filter", &state.filter),
+            ])
+            .send()
+            .await
+            .map_err(|e| {
+                eprintln!("Request error: {}", e);
+                e
+            })
+            .map_err(|e| NodeEvent::Error(e.to_string()))?;
+
+        if let Some(index_header) = response.headers().get("X-Consul-Index") {
+            if let Ok(index_str) = index_header.to_str() {
+                state.last_index = index_str.to_string();
+            }
+        }
+
+        let response_bytes = response.bytes().await.unwrap_or_default();
+        let nodes: Vec<Node> =
+            serde_json::from_slice(&response_bytes).map_err(|e| NodeEvent::Error(e.to_string()))?;
+
+        Ok(nodes)
+    }
+
+    fn process_node_changes(
+        state: &mut StreamState,
+        nodes: Vec<Node>,
+        state_arc: &Arc<Mutex<StreamState>>,
+    ) -> Option<(NodeEvent, Arc<Mutex<StreamState>>)> {
+        let current_nodes: HashSet<Node> = nodes.iter().cloned().collect();
+
+        let mut added_nodes: VecDeque<Node> = current_nodes
+            .difference(&state.known_nodes)
+            .cloned()
+            .collect();
+
+        let mut deleted_nodes: VecDeque<Node> = state
+            .known_nodes
+            .difference(&current_nodes)
+            .cloned()
+            .collect();
+
+        let mut updated_nodes = VecDeque::<Node>::new();
+
+        for node in current_nodes {
+            if let Some(version) = state.node_versions.get(&node.name) {
+                if version < &node.modify_index {
+                    updated_nodes.push_back(node.clone());
+                }
+            }
+        }
+
+        if let Some(new_node) = added_nodes.pop_front() {
+            state.known_nodes.insert(new_node.clone());
+            state.pending_added_nodes = added_nodes;
+            state.pending_deleted_nodes = deleted_nodes;
+            state.pending_updated_nodes = updated_nodes;
+
+            return Some((NodeEvent::Added(new_node), state_arc.clone()));
+        }
+
+        if let Some(removed_node) = deleted_nodes.pop_front() {
+            state.known_nodes.remove(&removed_node);
+            state.pending_added_nodes = added_nodes;
+            state.pending_deleted_nodes = deleted_nodes;
+            state.pending_updated_nodes = updated_nodes;
+            return Some((NodeEvent::Removed(removed_node), state_arc.clone()));
+        }
+
+        if let Some(updated_node) = updated_nodes.pop_front() {
+            state.known_nodes.remove(&updated_node);
+            state.known_nodes.insert(updated_node.clone());
+            state.pending_added_nodes = added_nodes;
+            state.pending_deleted_nodes = deleted_nodes;
+            state.pending_updated_nodes = updated_nodes;
+            return Some((NodeEvent::Updated(updated_node), state_arc.clone()));
+        }
+
+        None
+    }
+
+    /// Deregisters a node in the Consul catalog.
+    /// It uses a CatalogDeregistration struct to send the registration data.
+    /// Note that you can create a CatalogDeregistration from a Node using the From trait.
+    pub async fn deregister_node(
+        &self,
+        registration: CatalogDeregistration,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let response = self
+            .put("/v1/catalog/deregister")
+            .json(&registration)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let body = response.text().await?;
+            return Err(format!("Failed to register node: {}", body).into());
+        }
+
+        Ok(())
+    }
+
+    /// Registers a new node in the Consul catalog.
+    /// It uses a CatalogRegistration struct to send the registration data.
+    /// Note that you can create a CatalogRegistration from a Node using the From trait.
+    pub async fn register_node(
+        &self,
+        registration: CatalogRegistration,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let response = self
+            .put("/v1/catalog/register")
+            .json(&registration)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let body = response.text().await?;
+            return Err(format!("Failed to register node: {}", body).into());
+        }
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn new_with_client(host: String, port: u16, client: Client) -> Self {
+        Self { host, port, client }
+    }
+
+    fn put(&self, url: &str) -> reqwest::RequestBuilder {
+        let full_url = if self.port == 0 {
+            format!("http://{}{}", self.host, url)
+        } else {
+            format!("http://{}:{}{}", self.host, self.port, url)
+        };
+        self.client.put(full_url)
+    }
+
+    fn get(&self, url: &str) -> reqwest::RequestBuilder {
+        let full_url = if self.port == 0 {
+            format!("http://{}{}", self.host, url)
+        } else {
+            format!("http://{}:{}{}", self.host, self.port, url)
+        };
+        self.client.get(full_url)
+    }
+
+    fn base_url(&self) -> String {
+        if self.port == 0 {
+            format!("http://{}", self.host)
+        } else {
+            format!("http://{}:{}", self.host, self.port)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mockito::Server;
+    use serial_test::serial;
+
+    fn test_node() -> Node {
+        Node {
+            name: "test-node".to_string(),
+            address: "192.168.1.100".to_string(),
+            datacenter: Some("dc1".to_string()),
+            node_meta: Some({
+                let mut meta = HashMap::new();
+                meta.insert("env".to_string(), "test".to_string());
+                meta
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_register_node_success() {
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("PUT", "/v1/catalog/register")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("true")
+            .create();
+
+        let client = reqwest::Client::new();
+        let consul = Consul::new_with_client(server.host_with_port(), 0, client);
+        let node = test_node();
+
+        let result = consul.register_node((node).into()).await;
+        if let Err(e) = &result {
+            eprintln!("Error: {}", e);
+        }
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_register_node_with_minimal_data() {
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("PUT", "/v1/catalog/register")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("true")
+            .create();
+
+        let client = reqwest::Client::new();
+        let consul = Consul::new_with_client(server.host_with_port(), 0, client);
+        let node = Node {
+            name: "minimal-node".to_string(),
+            address: "10.0.0.1".to_string(),
+            datacenter: None,
+            node_meta: None,
+            ..Default::default()
+        };
+
+        let result = consul.register_node(node.into()).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_register_node_server_error() {
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("PUT", "/v1/catalog/register")
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body("Internal Server Error")
+            .create();
+
+        let client = reqwest::Client::new();
+        let consul = Consul::new_with_client(server.host_with_port(), 0, client);
+        let node = test_node();
+
+        let result = consul.register_node(node.into()).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Failed to register node")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_register_node_request_body() {
+        let mut server = Server::new_async().await;
+        let _m = server.mock("PUT", "/v1/catalog/register")
+            .match_body(mockito::Matcher::JsonString(r#"{"Node":"test-node","Address":"192.168.1.100","Datacenter":"dc1","NodeMeta":{"env":"test"},"Service":{"Service":"web","Port":8080,"Tags":["http","api"]}}"#.to_string()))
+            .with_status(200)
+            .with_body("true")
+            .create();
+
+        let client = reqwest::Client::new();
+        let consul = Consul::new_with_client(server.host_with_port(), 0, client);
+        let node = test_node();
+        let mut registration: CatalogRegistration = node.into();
+        registration.service = Some(ServiceDefinition {
+            Service: "web".to_string(),
+            Port: 8080,
+            Tags: Some(vec!["http".to_string(), "api".to_string()]),
+        });
+
+        let result = consul.register_node(registration).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_catalog_registration_from_node() {
+        let node = test_node();
+        let mut registration: CatalogRegistration = node.into();
+        registration.service = Some(ServiceDefinition {
+            Service: "web".to_string(),
+            Port: 8080,
+            Tags: Some(vec!["http".to_string(), "api".to_string()]),
+        });
+
+        assert_eq!(registration.node, "test-node");
+        assert_eq!(registration.address, "192.168.1.100");
+        assert_eq!(registration.datacenter, Some("dc1".to_string()));
+        assert!(registration.node_meta.is_some());
+        assert!(registration.service.is_some());
+
+        let service = registration.service.unwrap();
+        assert_eq!(service.Service, "web");
+        assert_eq!(service.Port, 8080);
+        assert_eq!(
+            service.Tags,
+            Some(vec!["http".to_string(), "api".to_string()])
+        );
+    }
+
+    // Integration tests against local Consul
+    fn random_node() -> Node {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        Node {
+            name: format!("test-node-{}", timestamp),
+            address: format!("192.168.1.{}", (timestamp % 254) + 1),
+            datacenter: Some("dc1".to_string()),
+            node_meta: Some({
+                let mut meta = std::collections::HashMap::new();
+                meta.insert("env".to_string(), "integration-test".to_string());
+                meta.insert("timestamp".to_string(), timestamp.to_string());
+                meta
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_register_node_integration_success() {
+        let consul = Consul::new("localhost", 8500);
+        let node = random_node();
+
+        let result = consul.register_node(node.clone().into()).await;
+        assert!(result.is_ok(), "Failed to register node: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn test_register_node_integration_minimal() {
+        let consul = Consul::new("localhost", 8500);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let node = Node {
+            name: format!("minimal-node-{}", timestamp),
+            address: format!("10.0.0.{}", (timestamp % 254) + 1),
+            datacenter: None,
+            node_meta: None,
+            ..Default::default()
+        };
+
+        let result = consul.register_node(node.clone().into()).await;
+        assert!(
+            result.is_ok(),
+            "Failed to register minimal node: {:?}",
+            result
+        );
+
+        println!("Successfully registered minimal node: {}", node.name);
+    }
+
+    #[tokio::test]
+    async fn test_register_multiple_nodes_integration() {
+        let consul = Consul::new("localhost", 8500);
+
+        for i in 0..3 {
+            let mut node = random_node();
+            node.name = format!("{}-{}", node.name, i);
+            node.address = format!("172.16.0.{}", i + 10);
+
+            let result = consul.register_node(node.clone().into()).await;
+            assert!(
+                result.is_ok(),
+                "Failed to register node {}: {:?}",
+                i,
+                result
+            );
+
+            println!("Successfully registered node {}: {}", i, node.name);
+        }
+    }
+    use futures::StreamExt;
+
+    #[tokio::test]
+    async fn test_watch_added_nodes() {
+        let consul = Consul::new("localhost", 8500);
+        let mut stream = consul.watch_nodes("");
+
+        // Create a task to wait for the new node
+        let new_added_node = random_node();
+        let new_deleted_node = random_node();
+        let expected_node_added_name = new_added_node.name.clone();
+        let expected_node_removed_name = new_deleted_node.name.clone();
+
+        let task = tokio::spawn(async move {
+            loop {
+                // Wait for the next node in the stream
+                tokio::select! {
+                    Some(node_event) = stream.next() => {
+                        match node_event {
+                            NodeEvent::Added(node) => {
+                                if node.name == expected_node_added_name {
+                                    assert_eq!(node.name, expected_node_added_name);
+                                    break;
+                                }
+                            },
+                            NodeEvent::Removed(_)|NodeEvent::Updated(_) => { },
+                            NodeEvent::Error(err) => {
+                                panic!("Stream error: {}", err);
+                            },
+                        }
+                    }
+                    else => break,
+                }
+            }
+        });
+
+        sleep(Duration::from_millis(100)).await;
+
+        consul
+            .register_node(new_added_node.clone().into())
+            .await
+            .unwrap();
+        consul
+            .deregister_node(new_deleted_node.clone().into())
+            .await
+            .unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_watch_removed_nodes() {
+        let consul = Consul::new("localhost", 8500);
+        let mut stream = consul.watch_nodes("");
+
+        // Create a task to wait for the new node
+        let new_deleted_node = random_node();
+        let expected_node_removed_name = new_deleted_node.name.clone();
+
+        consul
+            .register_node(new_deleted_node.clone().into())
+            .await
+            .unwrap();
+
+        let task = tokio::spawn(async move {
+            loop {
+                // Wait for the next node in the stream
+                tokio::select! {
+                    Some(node_event) = stream.next() => {
+                        match node_event {
+                            NodeEvent::Removed(node) => {
+                                if node.name == expected_node_removed_name {
+                                    assert_eq!(node.name, expected_node_removed_name);
+                                    break;
+                                }
+                            },
+                            NodeEvent::Added(_)|NodeEvent::Updated(_) => { },
+                            NodeEvent::Error(err) => {
+                                panic!("Stream error: {}", err);
+                            },
+                        }
+                    }
+                    else => break,
+                }
+            }
+        });
+
+        sleep(Duration::from_millis(100)).await;
+
+        consul
+            .deregister_node(new_deleted_node.clone().into())
+            .await
+            .unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_watch_updated_nodes() {
+        let consul = Consul::new("localhost", 8500);
+        let mut stream = consul.watch_nodes("");
+
+        // Create a task to wait for the new node
+        let outer_node = random_node();
+        let outer_node_name = outer_node.name.clone();
+
+        consul
+            .register_node(outer_node.clone().into())
+            .await
+            .unwrap();
+
+        let task = tokio::spawn(async move {
+            loop {
+                // Wait for the next node in the stream
+                tokio::select! {
+                    Some(node_event) = stream.next() => {
+                        match node_event {
+                            NodeEvent::Updated(node) => {
+                                if node.name == outer_node_name {
+                                    assert_eq!(node.name, outer_node_name);
+                                    assert!(node.node_meta.is_some());
+                                    assert!(node.node_meta.as_ref().unwrap().contains_key("modified"));
+                                    break;
+                                }
+                            },
+                            NodeEvent::Added(_)|NodeEvent::Removed(_) => { },
+                            NodeEvent::Error(err) => {
+                                panic!("Stream error: {}", err);
+                            },
+                        }
+                    }
+                    else => break,
+                }
+            }
+        });
+
+        sleep(Duration::from_millis(1000)).await;
+        let mut modified_node = outer_node.clone();
+        modified_node.node_meta = Some({
+            let mut meta = HashMap::new();
+            meta.insert("modified".to_string(), "true".to_string());
+            meta
+        });
+
+        consul
+            .register_node(modified_node.clone().into())
+            .await
+            .unwrap();
+        task.await.unwrap();
+    }
+}
