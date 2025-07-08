@@ -20,13 +20,20 @@ pub struct Consul {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 struct ServiceDefinition {
-    Service: String,
-    Port: u16,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    Tags: Option<Vec<String>>,
+    #[serde(rename = "ID", skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+
+    #[serde(rename = "Service")]
+    service: String,
+
+    #[serde(rename = "Port")]
+    port: u16,
+
+    #[serde(rename = "Tags", skip_serializing_if = "Option::is_none")]
+    tags: Option<Vec<String>>,
 }
 
-#[derive(Default, Debug, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Default, Debug, Deserialize, Clone)]
 pub struct Node {
     #[serde(rename = "ID", skip_serializing_if = "Option::is_none")]
     id: Option<String>,
@@ -58,6 +65,77 @@ impl std::hash::Hash for Node {
         self.name.hash(state);
     }
 }
+impl PartialEq for Node {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+    }
+}
+
+impl Eq for Node {}
+
+#[derive(Debug, Serialize)]
+enum CheckStatus {
+    #[serde(rename = "passing")]
+    Passing,
+
+    #[serde(rename = "warning")]
+    Warning,
+
+    #[serde(rename = "critical")]
+    Critical,
+}
+
+impl std::fmt::Display for CheckStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CheckStatus::Passing => write!(f, "passing"),
+            CheckStatus::Warning => write!(f, "warning"),
+            CheckStatus::Critical => write!(f, "critical"),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct CheckDefinition {
+    #[serde(rename = "Script", skip_serializing_if = "Option::is_none")]
+    script: Option<String>,
+
+    #[serde(rename = "Interval", skip_serializing_if = "Option::is_none")]
+    interval: Option<String>,
+
+    #[serde(rename = "Timeout", skip_serializing_if = "Option::is_none")]
+    timeout: Option<String>,
+
+    #[serde(rename = "HTTP", skip_serializing_if = "Option::is_none")]
+    http: Option<String>,
+
+    #[serde(rename = "TCP", skip_serializing_if = "Option::is_none")]
+    tcp: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CheckEntry {
+    #[serde(rename = "Name")]
+    name: String,
+
+    #[serde(rename = "CheckID", skip_serializing_if = "Option::is_none")]
+    check_id: Option<String>,
+
+    #[serde(rename = "Status")]
+    status: CheckStatus,
+
+    #[serde(rename = "ServiceID", skip_serializing_if = "Option::is_none")]
+    service_id: Option<String>,
+
+    #[serde(rename = "Notes", skip_serializing_if = "Option::is_none")]
+    notes: Option<String>,
+
+    #[serde(rename = "Definition", skip_serializing_if = "Option::is_none")]
+    definition: Option<CheckDefinition>,
+
+    #[serde(rename = "Output", skip_serializing_if = "Option::is_none")]
+    output: Option<String>,
+}
 
 #[derive(Debug, Serialize)]
 pub struct CatalogRegistration {
@@ -84,6 +162,12 @@ pub struct CatalogRegistration {
 
     #[serde(rename = "SkipNodeUpdate", skip_serializing_if = "Option::is_none")]
     skip_node_update: Option<bool>,
+
+    #[serde(rename = "Check", skip_serializing_if = "Option::is_none")]
+    check: Option<CheckEntry>,
+
+    #[serde(rename = "Checks", skip_serializing_if = "Option::is_none")]
+    checks: Option<Vec<CheckEntry>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -123,6 +207,8 @@ impl From<Node> for CatalogRegistration {
             tagged_addresses: node.tagged_addresses,
             id: node.id,
             skip_node_update: None,
+            check: None,
+            checks: None,
         }
     }
 }
@@ -192,7 +278,6 @@ impl NodeStreamState {
             .collect();
 
         let mut updated_nodes = VecDeque::<Node>::new();
-
         for node in current_nodes {
             if let Some(version) = self.node_versions.get(&node.name) {
                 if version < &node.modify_index {
@@ -203,6 +288,9 @@ impl NodeStreamState {
 
         if let Some(new_node) = added_nodes.pop_front() {
             self.known_nodes.insert(new_node.clone());
+            self.node_versions
+                .insert(new_node.name.clone(), new_node.modify_index);
+
             self.pending_added_nodes = added_nodes;
             self.pending_deleted_nodes = deleted_nodes;
             self.pending_updated_nodes = updated_nodes;
@@ -212,6 +300,8 @@ impl NodeStreamState {
 
         if let Some(removed_node) = deleted_nodes.pop_front() {
             self.known_nodes.remove(&removed_node);
+            self.node_versions.remove(&removed_node.name);
+
             self.pending_added_nodes = added_nodes;
             self.pending_deleted_nodes = deleted_nodes;
             self.pending_updated_nodes = updated_nodes;
@@ -221,6 +311,9 @@ impl NodeStreamState {
         if let Some(updated_node) = updated_nodes.pop_front() {
             self.known_nodes.remove(&updated_node);
             self.known_nodes.insert(updated_node.clone());
+            self.node_versions
+                .insert(updated_node.name.clone(), updated_node.modify_index);
+
             self.pending_added_nodes = added_nodes;
             self.pending_deleted_nodes = deleted_nodes;
             self.pending_updated_nodes = updated_nodes;
@@ -261,6 +354,7 @@ impl NodeStreamState {
     }
 }
 
+#[derive(Debug)]
 pub enum NodeEvent {
     Added(Node),
     Removed(Node),
@@ -485,9 +579,10 @@ mod tests {
         let node = test_node();
         let mut registration: CatalogRegistration = node.into();
         registration.service = Some(ServiceDefinition {
-            Service: "web".to_string(),
-            Port: 8080,
-            Tags: Some(vec!["http".to_string(), "api".to_string()]),
+            id: None,
+            service: "web".to_string(),
+            port: 8080,
+            tags: Some(vec!["http".to_string(), "api".to_string()]),
         });
 
         let result = consul.register_node(registration).await;
@@ -499,9 +594,10 @@ mod tests {
         let node = test_node();
         let mut registration: CatalogRegistration = node.into();
         registration.service = Some(ServiceDefinition {
-            Service: "web".to_string(),
-            Port: 8080,
-            Tags: Some(vec!["http".to_string(), "api".to_string()]),
+            id: None,
+            service: "web".to_string(),
+            port: 8080,
+            tags: Some(vec!["http".to_string(), "api".to_string()]),
         });
 
         assert_eq!(registration.node, "test-node");
@@ -511,10 +607,10 @@ mod tests {
         assert!(registration.service.is_some());
 
         let service = registration.service.unwrap();
-        assert_eq!(service.Service, "web");
-        assert_eq!(service.Port, 8080);
+        assert_eq!(service.service, "web");
+        assert_eq!(service.port, 8080);
         assert_eq!(
-            service.Tags,
+            service.tags,
             Some(vec!["http".to_string(), "api".to_string()])
         );
     }
@@ -522,13 +618,15 @@ mod tests {
     // Integration tests against local Consul
     fn random_node() -> Node {
         use std::time::{SystemTime, UNIX_EPOCH};
+        let name = format!("test-node-{}", rand::random::<u64>());
+
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
         Node {
-            name: format!("test-node-{}", timestamp),
+            name,
             address: format!("192.168.1.{}", (timestamp % 254) + 1),
             datacenter: Some("dc1".to_string()),
             node_meta: Some({
@@ -572,8 +670,6 @@ mod tests {
             "Failed to register minimal node: {:?}",
             result
         );
-
-        println!("Successfully registered minimal node: {}", node.name);
     }
 
     #[tokio::test]
@@ -592,8 +688,6 @@ mod tests {
                 i,
                 result
             );
-
-            println!("Successfully registered node {}: {}", i, node.name);
         }
     }
     use futures::StreamExt;
@@ -753,8 +847,23 @@ mod tests {
         // Create a task to wait for the new node
         let node = random_node();
         let expected_updated_node_name = node.name.clone();
+        let mut catalog_registration: CatalogRegistration = node.clone().into();
+        // catalog_registration.check = Some(CheckEntry {
+        //     name: "web-check".to_string(),
+        //     check_id: None,
+        //     status: CheckStatus::Passing,
+        //     service_id: None,
+        //     notes: Some("Web service check".to_string()),
+        //     definition: Some(CheckDefinition {
+        //         script: None,
+        //         interval: Some("10s".to_string()),
+        //         timeout: Some("5s".to_string()),
+        //         http: Some(format!("http://{}:8080/health", node.address)),
+        //         tcp: None,
+        //     }),
+        // });
 
-        consul.register_node(node.clone().into()).await.unwrap();
+        consul.register_node(catalog_registration).await.unwrap();
 
         let task = tokio::spawn(async move {
             loop {
@@ -789,11 +898,45 @@ mod tests {
             node_meta: None,
             node: node.name.clone(),
             service: Some(ServiceDefinition {
-                Service: "web".to_string(),
-                Port: 8080,
-                Tags: Some(vec!["http".to_string(), "api".to_string()]),
+                id: Some("web1".to_string()),
+                service: "web".to_string(),
+                port: 8080,
+                tags: Some(vec!["http".to_string(), "api".to_string()]),
             }),
             skip_node_update: None,
+            checks: Some(vec![
+                CheckEntry {
+                    name: "web-check".to_string(),
+                    check_id: Some("web".to_string()),
+                    status: CheckStatus::Passing,
+                    service_id: Some("web1".to_string()),
+                    notes: Some("Web service check".to_string()),
+                    output: Some("Web service is healthy".to_string()),
+                    definition: Some(CheckDefinition {
+                        script: None,
+                        interval: Some("10s".to_string()),
+                        timeout: Some("5s".to_string()),
+                        http: Some(format!("http://{}:8080/health", node.address)),
+                        tcp: None,
+                    }),
+                },
+                CheckEntry {
+                    name: "host-check".to_string(),
+                    check_id: None,
+                    status: CheckStatus::Passing,
+                    service_id: None,
+                    notes: Some("Web service check".to_string()),
+                    output: Some("Web service is healthy".to_string()),
+                    definition: Some(CheckDefinition {
+                        script: None,
+                        interval: Some("10s".to_string()),
+                        timeout: Some("5s".to_string()),
+                        http: None,
+                        tcp: Some("localhost:22".to_string()),
+                    }),
+                },
+            ]),
+            check: None,
         };
 
         consul.register_node(catalog_registration).await.unwrap();
