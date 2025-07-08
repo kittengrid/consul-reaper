@@ -124,7 +124,7 @@ impl From<Node> for CatalogRegistration {
 }
 
 #[derive(Debug, Clone)]
-struct StreamState {
+struct NodeStreamState {
     consul: Consul,
     last_index: String,
     known_nodes: HashSet<Node>,
@@ -133,6 +133,128 @@ struct StreamState {
     pending_updated_nodes: VecDeque<Node>,
     node_versions: HashMap<String, u64>,
     filter: String,
+}
+
+impl NodeStreamState {
+    fn new(consul: Consul, filter: String) -> Self {
+        Self {
+            consul,
+            last_index: "0".to_string(),
+            known_nodes: HashSet::new(),
+            pending_added_nodes: VecDeque::new(),
+            pending_deleted_nodes: VecDeque::new(),
+            pending_updated_nodes: VecDeque::new(),
+            node_versions: HashMap::new(),
+            filter,
+        }
+    }
+
+    fn handle_pending_nodes(&mut self) -> Option<NodeEvent> {
+        if let Some(node) = self.pending_added_nodes.pop_front() {
+            self.known_nodes.insert(node.clone());
+            self.node_versions
+                .insert(node.name.clone(), node.modify_index);
+            return Some(NodeEvent::Added(node));
+        }
+        if let Some(node) = self.pending_deleted_nodes.pop_front() {
+            self.known_nodes.remove(&node);
+            self.node_versions.remove(&node.name);
+            return Some(NodeEvent::Removed(node));
+        }
+        if let Some(node) = self.pending_updated_nodes.pop_front() {
+            self.known_nodes.remove(&node);
+            *self
+                .node_versions
+                .entry(node.name.clone())
+                .or_insert(node.modify_index) = node.modify_index;
+            self.known_nodes.insert(node.clone());
+            return Some(NodeEvent::Updated(node));
+        }
+        None
+    }
+
+    fn process_node_changes(&mut self, nodes: Vec<Node>) -> Option<NodeEvent> {
+        let current_nodes: HashSet<Node> = nodes.iter().cloned().collect();
+
+        let mut added_nodes: VecDeque<Node> = current_nodes
+            .difference(&self.known_nodes)
+            .cloned()
+            .collect();
+
+        let mut deleted_nodes: VecDeque<Node> = self
+            .known_nodes
+            .difference(&current_nodes)
+            .cloned()
+            .collect();
+
+        let mut updated_nodes = VecDeque::<Node>::new();
+
+        for node in current_nodes {
+            if let Some(version) = self.node_versions.get(&node.name) {
+                if version < &node.modify_index {
+                    updated_nodes.push_back(node.clone());
+                }
+            }
+        }
+
+        if let Some(new_node) = added_nodes.pop_front() {
+            self.known_nodes.insert(new_node.clone());
+            self.pending_added_nodes = added_nodes;
+            self.pending_deleted_nodes = deleted_nodes;
+            self.pending_updated_nodes = updated_nodes;
+
+            return Some(NodeEvent::Added(new_node));
+        }
+
+        if let Some(removed_node) = deleted_nodes.pop_front() {
+            self.known_nodes.remove(&removed_node);
+            self.pending_added_nodes = added_nodes;
+            self.pending_deleted_nodes = deleted_nodes;
+            self.pending_updated_nodes = updated_nodes;
+            return Some(NodeEvent::Removed(removed_node));
+        }
+
+        if let Some(updated_node) = updated_nodes.pop_front() {
+            self.known_nodes.remove(&updated_node);
+            self.known_nodes.insert(updated_node.clone());
+            self.pending_added_nodes = added_nodes;
+            self.pending_deleted_nodes = deleted_nodes;
+            self.pending_updated_nodes = updated_nodes;
+            return Some(NodeEvent::Updated(updated_node));
+        }
+
+        None
+    }
+
+    async fn fetch_nodes_from_consul(&mut self) -> Result<Vec<Node>, NodeEvent> {
+        let response = self
+            .consul
+            .get("/v1/catalog/nodes?{}")
+            .query(&[
+                ("wait", "5s"),
+                ("index", &self.last_index),
+                ("filter", &self.filter),
+            ])
+            .send()
+            .await
+            .map_err(|e| {
+                eprintln!("Request error: {}", e);
+                e
+            })
+            .map_err(|e| NodeEvent::Error(e.to_string()))?;
+
+        if let Some(index_header) = response.headers().get("X-Consul-Index") {
+            if let Ok(index_str) = index_header.to_str() {
+                self.last_index = index_str.to_string();
+            }
+        }
+
+        let response_bytes = response.bytes().await.unwrap_or_default();
+        let nodes: Vec<Node> =
+            serde_json::from_slice(&response_bytes).map_err(|e| NodeEvent::Error(e.to_string()))?;
+
+        Ok(nodes)
+    }
 }
 
 pub enum NodeEvent {
@@ -152,18 +274,9 @@ impl Consul {
         }
     }
 
-    /// A tokio::stream that will return new nodes as they are registered in Consul.
+    /// A tokio::stream that will return new nodes as they are registered/deregisterd/updated in Consul.
     pub fn watch_nodes(&self, filter: &str) -> Pin<Box<dyn Stream<Item = NodeEvent> + Send>> {
-        let state = StreamState {
-            consul: self.clone(),
-            last_index: "0".to_string(),
-            known_nodes: HashSet::new(),
-            pending_added_nodes: VecDeque::new(),
-            pending_deleted_nodes: VecDeque::new(),
-            pending_updated_nodes: VecDeque::new(),
-            node_versions: HashMap::new(),
-            filter: filter.to_string(),
-        };
+        let state = NodeStreamState::new(self.clone(), filter.to_string());
 
         Box::pin(stream::unfold(
             Arc::new(Mutex::new(state)),
@@ -171,16 +284,14 @@ impl Consul {
                 let mut state_guard = state.lock().await;
 
                 loop {
-                    if let Some(event) = Self::handle_pending_nodes(&mut state_guard, &state) {
-                        return Some(event);
+                    if let Some(event) = state_guard.handle_pending_nodes() {
+                        return Some((event, state.clone()));
                     }
 
-                    match Self::fetch_nodes_from_consul(&mut state_guard).await {
+                    match state_guard.fetch_nodes_from_consul().await {
                         Ok(nodes) => {
-                            if let Some(event) =
-                                Self::process_node_changes(&mut state_guard, nodes, &state)
-                            {
-                                return Some(event);
+                            if let Some(event) = state_guard.process_node_changes(nodes) {
+                                return Some((event, state.clone()));
                             }
                             sleep(Duration::from_secs(1)).await;
                         }
@@ -191,121 +302,6 @@ impl Consul {
                 }
             },
         ))
-    }
-
-    fn handle_pending_nodes(
-        state: &mut StreamState,
-        state_arc: &Arc<Mutex<StreamState>>,
-    ) -> Option<(NodeEvent, Arc<Mutex<StreamState>>)> {
-        if let Some(node) = state.pending_added_nodes.pop_front() {
-            state.known_nodes.insert(node.clone());
-            state
-                .node_versions
-                .insert(node.name.clone(), node.modify_index);
-            return Some((NodeEvent::Added(node), state_arc.clone()));
-        }
-        if let Some(node) = state.pending_deleted_nodes.pop_front() {
-            state.known_nodes.remove(&node);
-            state.node_versions.remove(&node.name);
-            return Some((NodeEvent::Removed(node), state_arc.clone()));
-        }
-        if let Some(node) = state.pending_updated_nodes.pop_front() {
-            state.known_nodes.remove(&node);
-            *state
-                .node_versions
-                .entry(node.name.clone())
-                .or_insert(node.modify_index) = node.modify_index;
-            state.known_nodes.insert(node.clone());
-            return Some((NodeEvent::Updated(node), state_arc.clone()));
-        }
-        None
-    }
-
-    async fn fetch_nodes_from_consul(state: &mut StreamState) -> Result<Vec<Node>, NodeEvent> {
-        let response = state
-            .consul
-            .get("/v1/catalog/nodes?{}")
-            .query(&[
-                ("wait", "5s"),
-                ("index", &state.last_index),
-                ("filter", &state.filter),
-            ])
-            .send()
-            .await
-            .map_err(|e| {
-                eprintln!("Request error: {}", e);
-                e
-            })
-            .map_err(|e| NodeEvent::Error(e.to_string()))?;
-
-        if let Some(index_header) = response.headers().get("X-Consul-Index") {
-            if let Ok(index_str) = index_header.to_str() {
-                state.last_index = index_str.to_string();
-            }
-        }
-
-        let response_bytes = response.bytes().await.unwrap_or_default();
-        let nodes: Vec<Node> =
-            serde_json::from_slice(&response_bytes).map_err(|e| NodeEvent::Error(e.to_string()))?;
-
-        Ok(nodes)
-    }
-
-    fn process_node_changes(
-        state: &mut StreamState,
-        nodes: Vec<Node>,
-        state_arc: &Arc<Mutex<StreamState>>,
-    ) -> Option<(NodeEvent, Arc<Mutex<StreamState>>)> {
-        let current_nodes: HashSet<Node> = nodes.iter().cloned().collect();
-
-        let mut added_nodes: VecDeque<Node> = current_nodes
-            .difference(&state.known_nodes)
-            .cloned()
-            .collect();
-
-        let mut deleted_nodes: VecDeque<Node> = state
-            .known_nodes
-            .difference(&current_nodes)
-            .cloned()
-            .collect();
-
-        let mut updated_nodes = VecDeque::<Node>::new();
-
-        for node in current_nodes {
-            if let Some(version) = state.node_versions.get(&node.name) {
-                if version < &node.modify_index {
-                    updated_nodes.push_back(node.clone());
-                }
-            }
-        }
-
-        if let Some(new_node) = added_nodes.pop_front() {
-            state.known_nodes.insert(new_node.clone());
-            state.pending_added_nodes = added_nodes;
-            state.pending_deleted_nodes = deleted_nodes;
-            state.pending_updated_nodes = updated_nodes;
-
-            return Some((NodeEvent::Added(new_node), state_arc.clone()));
-        }
-
-        if let Some(removed_node) = deleted_nodes.pop_front() {
-            state.known_nodes.remove(&removed_node);
-            state.pending_added_nodes = added_nodes;
-            state.pending_deleted_nodes = deleted_nodes;
-            state.pending_updated_nodes = updated_nodes;
-            return Some((NodeEvent::Removed(removed_node), state_arc.clone()));
-        }
-
-        if let Some(updated_node) = updated_nodes.pop_front() {
-            state.known_nodes.remove(&updated_node);
-            state.known_nodes.insert(updated_node.clone());
-            state.pending_added_nodes = added_nodes;
-            state.pending_deleted_nodes = deleted_nodes;
-            state.pending_updated_nodes = updated_nodes;
-            return Some((NodeEvent::Updated(updated_node), state_arc.clone()));
-        }
-
-        None
     }
 
     /// Deregisters a node in the Consul catalog.
