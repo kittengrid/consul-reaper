@@ -1,0 +1,96 @@
+name: Build and Release Kittengrid Agent
+
+on:
+ push:
+   branch: 'main'
+   tags:
+     - 'v*'
+jobs:
+  build:
+    name: Build Binaries
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64]
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-musl
+            bin_name: consul-reaper
+            artifact_name: consul-reaper-linux-amd64
+          - arch: aarch64
+            target: aarch64-unknown-linux-musl
+            bin_name: consul-reaper
+            artifact_name: consul-reaper-linux-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          override: true
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build binary
+        run: cross build --profile release-with-debug --target ${{ matrix.target }}
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release-with-debug/${{ matrix.bin_name }} dist/
+          cd dist
+          tar -czvf ${{ matrix.artifact_name }}.tar.gz ${{ matrix.bin_name }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.artifact_name }}.tar.gz
+
+  create-release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version from tag
+        id: get_version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: ${{ steps.get_version.outputs.VERSION }}
+          draft: false
+          prerelease: false
+          files: |
+            artifacts/consul-reaper-linux-amd64/*.tar.gz
+            artifacts/consul-reaper-linux-arm64/*.tar.gz
+          body: |
+            ## Kittengrid Agent ${{ steps.get_version.outputs.VERSION }}
+
+            ### Available Binaries:
+
+            - Linux x86_64 (Intel/AMD)
+            - Linux ARM64 (ARM)
+
+            ### Installation
+
+            1. Download the appropriate binary for your system
+            2. Extract it: `tar -xzf consul-reaper-*.tar.gz`
+            3. Move it to your PATH: `sudo mv consul-reaper /usr/local/bin/`
+            4. Make it executable: `chmod +x /usr/local/bin/consul-reaper`
