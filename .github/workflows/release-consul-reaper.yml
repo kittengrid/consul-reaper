@@ -36,12 +36,12 @@ jobs:
         run: cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Build binary
-        run: cross build --profile release-with-debug --target ${{ matrix.target }}
+        run: cross build --profile release --target ${{ matrix.target }}
 
       - name: Package binary
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release-with-debug/${{ matrix.bin_name }} dist/
+          cp target/${{ matrix.target }}/release/${{ matrix.bin_name }} dist/
           cd dist
           tar -czvf ${{ matrix.artifact_name }}.tar.gz ${{ matrix.bin_name }}
 
