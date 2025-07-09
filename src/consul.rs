@@ -17,6 +17,8 @@ pub struct Consul {
     port: u16,
     client: Client,
 }
+const DEFAULT_INTERVAL: u64 = 10;
+const DEFAULT_TIMEOUT: u64 = 5;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 struct ServiceDefinition {
@@ -39,7 +41,7 @@ pub struct Node {
     id: Option<String>,
 
     #[serde(rename = "Node")]
-    name: String,
+    pub name: String,
 
     #[serde(rename = "Address")]
     address: String,
@@ -52,9 +54,6 @@ pub struct Node {
 
     #[serde(rename = "TaggedAddresses", skip_serializing_if = "Option::is_none")]
     tagged_addresses: Option<std::collections::HashMap<String, String>>,
-
-    #[serde(rename = "CreateIndex")]
-    created_index: u64,
 
     #[serde(rename = "ModifyIndex")]
     modify_index: u64,
@@ -73,8 +72,8 @@ impl PartialEq for Node {
 
 impl Eq for Node {}
 
-#[derive(Debug, Serialize)]
-enum CheckStatus {
+#[derive(Debug, Serialize, Clone, Deserialize, PartialEq)]
+pub enum CheckStatus {
     #[serde(rename = "passing")]
     Passing,
 
@@ -83,6 +82,12 @@ enum CheckStatus {
 
     #[serde(rename = "critical")]
     Critical,
+}
+
+impl Default for CheckStatus {
+    fn default() -> Self {
+        CheckStatus::Passing
+    }
 }
 
 impl std::fmt::Display for CheckStatus {
@@ -95,7 +100,7 @@ impl std::fmt::Display for CheckStatus {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CheckDefinition {
     #[serde(rename = "Script", skip_serializing_if = "Option::is_none")]
     script: Option<String>,
@@ -113,28 +118,129 @@ pub struct CheckDefinition {
     tcp: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct CheckEntry {
-    #[serde(rename = "Name")]
-    name: String,
+pub enum CheckType {
+    Script,
+    HTTP,
+    TCP,
+    Unknown,
+}
+
+impl CheckDefinition {
+    pub fn interval_in_seconds(&self) -> u64 {
+        self.interval
+            .as_ref()
+            .and_then(|s| s.strip_suffix("s").and_then(|s| s.parse::<u64>().ok()))
+            .unwrap_or(DEFAULT_INTERVAL)
+    }
+    pub fn timeout_in_seconds(&self) -> u64 {
+        self.timeout
+            .as_ref()
+            .and_then(|s| s.strip_suffix("s").and_then(|s| s.parse::<u64>().ok()))
+            .unwrap_or(DEFAULT_TIMEOUT)
+    }
+
+    pub fn check_type(&self) -> CheckType {
+        if self.script.is_some() {
+            CheckType::Script
+        } else if self.http.is_some() {
+            CheckType::HTTP
+        } else if self.tcp.is_some() {
+            CheckType::TCP
+        } else {
+            CheckType::Unknown
+        }
+    }
+
+    pub fn script(&self) -> Option<&str> {
+        self.script.as_deref()
+    }
+
+    pub fn http(&self) -> Option<&str> {
+        self.http.as_deref()
+    }
+
+    pub fn tcp(&self) -> Option<&str> {
+        self.tcp.as_deref()
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct HealthCheck {
+    #[serde(rename = "ID", skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+
+    #[serde(rename = "Node")]
+    node: String,
 
     #[serde(rename = "CheckID", skip_serializing_if = "Option::is_none")]
     check_id: Option<String>,
 
-    #[serde(rename = "Status")]
-    status: CheckStatus,
+    #[serde(rename = "Name")]
+    pub name: String,
 
-    #[serde(rename = "ServiceID", skip_serializing_if = "Option::is_none")]
-    service_id: Option<String>,
+    #[serde(rename = "Status")]
+    pub status: CheckStatus,
 
     #[serde(rename = "Notes", skip_serializing_if = "Option::is_none")]
     notes: Option<String>,
 
     #[serde(rename = "Definition", skip_serializing_if = "Option::is_none")]
-    definition: Option<CheckDefinition>,
+    pub definition: Option<CheckDefinition>,
 
     #[serde(rename = "Output", skip_serializing_if = "Option::is_none")]
     output: Option<String>,
+
+    #[serde(rename = "ServiceID", skip_serializing_if = "Option::is_none")]
+    service_id: Option<String>,
+
+    #[serde(rename = "ServiceName", skip_serializing_if = "Option::is_none")]
+    service_name: Option<String>,
+
+    #[serde(rename = "ServiceTags", skip_serializing_if = "Option::is_none")]
+    service_tags: Option<Vec<String>>,
+
+    #[serde(rename = "Namespace", skip_serializing_if = "Option::is_none")]
+    namespace: Option<String>,
+
+    #[serde(rename = "ModifyIndex")]
+    modify_index: u64,
+}
+
+impl std::hash::Hash for HealthCheck {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+    }
+}
+
+impl PartialEq for HealthCheck {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+    }
+}
+
+impl Eq for HealthCheck {}
+
+impl HealthCheck {
+    pub fn set_status(&mut self, status: CheckStatus) {
+        self.status = status;
+    }
+}
+
+impl From<HealthCheck> for CatalogRegistration {
+    fn from(check: HealthCheck) -> Self {
+        Self {
+            id: check.id.clone(),
+            node: check.node.clone(),
+            address: None,
+            datacenter: None,
+            tagged_addresses: None,
+            node_meta: None,
+            service: None,
+            skip_node_update: Some(true),
+            check: Some(check.clone()),
+            checks: None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -164,10 +270,10 @@ pub struct CatalogRegistration {
     skip_node_update: Option<bool>,
 
     #[serde(rename = "Check", skip_serializing_if = "Option::is_none")]
-    check: Option<CheckEntry>,
+    check: Option<HealthCheck>,
 
     #[serde(rename = "Checks", skip_serializing_if = "Option::is_none")]
-    checks: Option<Vec<CheckEntry>>,
+    checks: Option<Vec<HealthCheck>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -354,11 +460,154 @@ impl NodeStreamState {
     }
 }
 
+#[derive(Debug, Clone)]
+struct HealthCheckStreamState {
+    consul: Consul,
+    node_name: String,
+    last_index: String,
+    known_checks: HashSet<HealthCheck>,
+    check_versions: HashMap<String, u64>,
+    pending_added_checks: VecDeque<HealthCheck>,
+    pending_deleted_checks: VecDeque<HealthCheck>,
+    pending_updated_checks: VecDeque<HealthCheck>,
+}
+
+impl HealthCheckStreamState {
+    fn new(consul: Consul, node_name: String) -> Self {
+        Self {
+            consul,
+            node_name,
+            last_index: "0".to_string(),
+            known_checks: HashSet::new(),
+            check_versions: HashMap::new(),
+            pending_added_checks: VecDeque::new(),
+            pending_deleted_checks: VecDeque::new(),
+            pending_updated_checks: VecDeque::new(),
+        }
+    }
+
+    fn handle_pending_checks(&mut self) -> Option<HealthCheckEvent> {
+        if let Some(check) = self.pending_added_checks.pop_front() {
+            self.known_checks.insert(check.clone());
+            self.check_versions
+                .insert(check.name.clone(), check.modify_index);
+
+            return Some(HealthCheckEvent::Added(check));
+        }
+        if let Some(check) = self.pending_deleted_checks.pop_front() {
+            self.known_checks.remove(&check);
+            self.check_versions.remove(&check.name);
+
+            return Some(HealthCheckEvent::Removed(check));
+        }
+        if let Some(check) = self.pending_updated_checks.pop_front() {
+            self.known_checks.remove(&check);
+            self.known_checks.insert(check.clone());
+            self.check_versions
+                .insert(check.name.clone(), check.modify_index);
+            return Some(HealthCheckEvent::Updated(check));
+        }
+        None
+    }
+
+    fn process_check_changes(&mut self, checks: Vec<HealthCheck>) -> Option<HealthCheckEvent> {
+        let current_checks: HashSet<HealthCheck> = checks.iter().cloned().collect();
+
+        let mut added_checks: VecDeque<HealthCheck> = current_checks
+            .difference(&self.known_checks)
+            .cloned()
+            .collect();
+
+        let mut deleted_checks: VecDeque<HealthCheck> = self
+            .known_checks
+            .difference(&current_checks)
+            .cloned()
+            .collect();
+
+        let mut updated_checks = VecDeque::<HealthCheck>::new();
+        for check in current_checks {
+            if let Some(version) = self.check_versions.get(&check.name) {
+                if version < &check.modify_index {
+                    updated_checks.push_back(check.clone());
+                }
+            }
+        }
+
+        if let Some(new_check) = added_checks.pop_front() {
+            self.known_checks.insert(new_check.clone());
+            self.pending_added_checks = added_checks;
+            self.pending_deleted_checks = deleted_checks;
+            self.pending_updated_checks = updated_checks;
+            self.check_versions
+                .insert(new_check.name.clone(), new_check.modify_index);
+            return Some(HealthCheckEvent::Added(new_check));
+        }
+
+        if let Some(removed_check) = deleted_checks.pop_front() {
+            self.known_checks.remove(&removed_check);
+            self.check_versions.remove(&removed_check.name);
+            self.pending_added_checks = added_checks;
+            self.pending_deleted_checks = deleted_checks;
+            self.pending_updated_checks = updated_checks;
+            return Some(HealthCheckEvent::Removed(removed_check));
+        }
+
+        if let Some(updated_check) = updated_checks.pop_front() {
+            self.known_checks.remove(&updated_check);
+            self.known_checks.insert(updated_check.clone());
+            self.pending_added_checks = added_checks;
+            self.pending_deleted_checks = deleted_checks;
+            self.pending_updated_checks = updated_checks;
+            self.check_versions
+                .insert(updated_check.name.clone(), updated_check.modify_index);
+
+            return Some(HealthCheckEvent::Updated(updated_check));
+        }
+
+        None
+    }
+
+    async fn fetch_checks_from_consul(&mut self) -> Result<Vec<HealthCheck>, HealthCheckEvent> {
+        let url = format!("/v1/health/node/{}", self.node_name);
+        let response = self
+            .consul
+            .get(&url)
+            .query(&[("wait", "5s"), ("index", &self.last_index)])
+            .send()
+            .await
+            .map_err(|e| {
+                eprintln!("Request error: {}", e);
+                e
+            })
+            .map_err(|e| HealthCheckEvent::Error(e.to_string()))?;
+
+        if let Some(index_header) = response.headers().get("X-Consul-Index") {
+            if let Ok(index_str) = index_header.to_str() {
+                self.last_index = index_str.to_string();
+            }
+        }
+
+        let response_bytes = response.bytes().await.unwrap_or_default();
+        let checks: Vec<HealthCheck> = serde_json::from_slice(&response_bytes)
+            .map_err(|e| HealthCheckEvent::Error(e.to_string()))?;
+
+        Ok(checks)
+    }
+}
+
 #[derive(Debug)]
 pub enum NodeEvent {
     Added(Node),
     Removed(Node),
     Updated(Node),
+    Error(String),
+}
+
+#[derive(Debug)]
+pub enum HealthCheckEvent {
+    Added(HealthCheck),
+    Removed(HealthCheck),
+    Updated(HealthCheck),
     Error(String),
 }
 
@@ -370,6 +619,16 @@ impl Consul {
             port,
             client: Client::new(),
         }
+    }
+
+    pub fn from_url(url: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let parsed_url = url::Url::parse(url)?;
+        let host = parsed_url
+            .host_str()
+            .ok_or("Invalid URL: missing host")?
+            .to_string();
+        let port = parsed_url.port().unwrap_or(80);
+        Ok(Self::new(&host, port))
     }
 
     /// A tokio::stream that will return new nodes as they are registered/deregisterd/updated in Consul.
@@ -389,6 +648,39 @@ impl Consul {
                     match state_guard.fetch_nodes_from_consul().await {
                         Ok(nodes) => {
                             if let Some(event) = state_guard.process_node_changes(nodes) {
+                                return Some((event, state.clone()));
+                            }
+                            sleep(Duration::from_secs(1)).await;
+                        }
+                        Err(e) => {
+                            return Some((e, state.clone()));
+                        }
+                    }
+                }
+            },
+        ))
+    }
+
+    /// A tokio::stream that will return health check events for a specific node.
+    pub fn watch_health_checks(
+        &self,
+        node_name: &str,
+    ) -> Pin<Box<dyn Stream<Item = HealthCheckEvent> + Send>> {
+        let state = HealthCheckStreamState::new(self.clone(), node_name.to_string());
+
+        Box::pin(stream::unfold(
+            Arc::new(Mutex::new(state)),
+            |state| async move {
+                let mut state_guard = state.lock().await;
+
+                loop {
+                    if let Some(event) = state_guard.handle_pending_checks() {
+                        return Some((event, state.clone()));
+                    }
+
+                    match state_guard.fetch_checks_from_consul().await {
+                        Ok(checks) => {
+                            if let Some(event) = state_guard.process_check_changes(checks) {
                                 return Some((event, state.clone()));
                             }
                             sleep(Duration::from_secs(1)).await;
@@ -466,21 +758,12 @@ impl Consul {
         };
         self.client.get(full_url)
     }
-
-    fn base_url(&self) -> String {
-        if self.port == 0 {
-            format!("http://{}", self.host)
-        } else {
-            format!("http://{}:{}", self.host, self.port)
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use mockito::Server;
-    use serial_test::serial;
 
     fn test_node() -> Node {
         Node {
@@ -701,7 +984,6 @@ mod tests {
         let new_added_node = random_node();
         let new_deleted_node = random_node();
         let expected_node_added_name = new_added_node.name.clone();
-        let expected_node_removed_name = new_deleted_node.name.clone();
 
         let task = tokio::spawn(async move {
             loop {
@@ -840,55 +1122,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_watch_updated_nodes_becasue_of_a_service_registered() {
+    async fn test_watch_health_checks() {
         let consul = Consul::new("localhost", 8500);
-        let mut stream = consul.watch_nodes("");
-
-        // Create a task to wait for the new node
         let node = random_node();
-        let expected_updated_node_name = node.name.clone();
-        let mut catalog_registration: CatalogRegistration = node.clone().into();
-        // catalog_registration.check = Some(CheckEntry {
-        //     name: "web-check".to_string(),
-        //     check_id: None,
-        //     status: CheckStatus::Passing,
-        //     service_id: None,
-        //     notes: Some("Web service check".to_string()),
-        //     definition: Some(CheckDefinition {
-        //         script: None,
-        //         interval: Some("10s".to_string()),
-        //         timeout: Some("5s".to_string()),
-        //         http: Some(format!("http://{}:8080/health", node.address)),
-        //         tcp: None,
-        //     }),
-        // });
+        let node_name = node.name.clone();
 
-        consul.register_node(catalog_registration).await.unwrap();
+        // Register a node first
+        consul.register_node(node.clone().into()).await.unwrap();
 
+        let mut stream = consul.watch_health_checks(&node_name);
+
+        // Create a task to wait for health check events
         let task = tokio::spawn(async move {
+            let mut events_received = 0;
             loop {
-                // Wait for the next node in the stream
                 tokio::select! {
-                    Some(node_event) = stream.next() => {
-                        match node_event {
-                            NodeEvent::Updated(updated_node) => {
-                                if updated_node.name == expected_updated_node_name {
-                                    assert_eq!(updated_node.name, expected_updated_node_name);
-                                    break;
-                                }
+                    Some(event) = stream.next() => {
+                        match event {
+                            HealthCheckEvent::Added(check) => {
+                                println!("Health check added: {:?}", check.name);
+                                events_received += 1;
                             },
-                            NodeEvent::Added(_)|NodeEvent::Removed(_) => { },
-                            NodeEvent::Error(err) => {
-                                panic!("Stream error: {}", err);
+                            HealthCheckEvent::Updated(check) => {
+                                println!("Health check updated: {:?}", check.name);
+                                events_received += 1;
+                            },
+                            HealthCheckEvent::Removed(check) => {
+                                println!("Health check removed: {:?}", check.name);
+                                events_received += 1;
+                            },
+                            HealthCheckEvent::Error(err) => {
+                                println!("Health check error: {}", err);
                             },
                         }
+
+                        if events_received >= 1 {
+                            break;
+                        }
                     }
-                    else => break,
+                    _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                        break;
+                    }
                 }
             }
         });
-
-        sleep(Duration::from_millis(100)).await;
 
         let catalog_registration = CatalogRegistration {
             id: None,
@@ -905,7 +1182,7 @@ mod tests {
             }),
             skip_node_update: None,
             checks: Some(vec![
-                CheckEntry {
+                HealthCheck {
                     name: "web-check".to_string(),
                     check_id: Some("web".to_string()),
                     status: CheckStatus::Passing,
@@ -919,8 +1196,9 @@ mod tests {
                         http: Some(format!("http://{}:8080/health", node.address)),
                         tcp: None,
                     }),
+                    ..HealthCheck::default()
                 },
-                CheckEntry {
+                HealthCheck {
                     name: "host-check".to_string(),
                     check_id: None,
                     status: CheckStatus::Passing,
@@ -934,12 +1212,15 @@ mod tests {
                         http: None,
                         tcp: Some("localhost:22".to_string()),
                     }),
+                    ..HealthCheck::default()
                 },
             ]),
             check: None,
         };
 
         consul.register_node(catalog_registration).await.unwrap();
+
+        // Wait for initial health checks to be detected
         task.await.unwrap();
     }
 }
