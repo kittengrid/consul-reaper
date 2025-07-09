@@ -2,7 +2,6 @@ name: Build and Release Kittengrid Agent
 
 on:
  push:
-   branches: ['main']
    tags:
      - 'v*'
 jobs:
