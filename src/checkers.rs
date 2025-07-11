@@ -1,6 +1,12 @@
+use crate::consul::CheckDefinition;
 use thiserror::Error;
 use tokio::time::timeout;
 use tracing::debug;
+
+#[async_trait::async_trait]
+pub trait HealthChecker {
+    async fn check(&self) -> Result<(), HealthCheckError>;
+}
 
 pub struct TCPChecker {
     address: String,
@@ -21,12 +27,18 @@ impl std::fmt::Display for HealthCheckError {
     }
 }
 
-impl TCPChecker {
-    pub fn new(address: String, timeout: u64) -> Self {
-        TCPChecker { address, timeout }
+impl From<&CheckDefinition> for TCPChecker {
+    fn from(definition: &CheckDefinition) -> Self {
+        TCPChecker {
+            address: definition.tcp().unwrap().to_string(),
+            timeout: definition.timeout_in_seconds(),
+        }
     }
+}
 
-    pub async fn check(&self) -> Result<(), HealthCheckError> {
+#[async_trait::async_trait]
+impl HealthChecker for TCPChecker {
+    async fn check(&self) -> Result<(), HealthCheckError> {
         let timeout_duration = std::time::Duration::from_secs(self.timeout);
         debug!("Checking TCP connection to {}", self.address);
         match timeout(
@@ -47,15 +59,18 @@ pub struct HTTPChecker {
     timeout: u64,
 }
 
-impl HTTPChecker {
-    pub fn new(url: String, timeout: u64) -> Self {
+impl From<&CheckDefinition> for HTTPChecker {
+    fn from(definition: &CheckDefinition) -> Self {
         HTTPChecker {
-            address: url,
-            timeout,
+            address: definition.http().unwrap().to_string(),
+            timeout: definition.timeout_in_seconds(),
         }
     }
+}
 
-    pub async fn check(&self) -> Result<(), HealthCheckError> {
+#[async_trait::async_trait]
+impl HealthChecker for HTTPChecker {
+    async fn check(&self) -> Result<(), HealthCheckError> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(self.timeout))
             .build()
@@ -72,7 +87,7 @@ impl HTTPChecker {
                     )))
                 }
             }
-            Err(e) => Err(HealthCheckError::Timeout),
+            Err(_) => Err(HealthCheckError::Timeout),
         }
     }
 }
