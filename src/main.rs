@@ -301,7 +301,7 @@ impl NodeHealthChecker {
 #[command(version, about, long_about = None)]
 struct Args {
     #[arg(long, env, default_value = "http://localhost:8500")]
-    consul_addr: String,
+    consul_http_addr: String,
 
     #[arg(long, env)]
     wg_network: String,
@@ -315,8 +315,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
 
-    info!("Consul address: {}", args.consul_addr);
-    let consul = consul::Consul::from_url(&args.consul_addr)?;
+    info!("Consul address: {}", args.consul_http_addr);
+    let consul = consul::Consul::from_url(&args.consul_http_addr)?;
 
     let node_health_checkers: Arc<RwLock<HashMap<String, NodeHealthChecker>>> =
         Arc::new(RwLock::new(HashMap::new()));
