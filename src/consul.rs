@@ -151,10 +151,6 @@ impl CheckDefinition {
         }
     }
 
-    pub fn script(&self) -> Option<&str> {
-        self.script.as_deref()
-    }
-
     pub fn http(&self) -> Option<&str> {
         self.http.as_deref()
     }
@@ -223,23 +219,6 @@ impl Eq for HealthCheck {}
 impl HealthCheck {
     pub fn set_status(&mut self, status: CheckStatus) {
         self.status = status;
-    }
-}
-
-impl From<HealthCheck> for CatalogRegistration {
-    fn from(check: HealthCheck) -> Self {
-        Self {
-            id: check.id.clone(),
-            node: check.node.clone(),
-            address: None,
-            datacenter: None,
-            tagged_addresses: None,
-            node_meta: None,
-            service: None,
-            skip_node_update: Some(true),
-            check: Some(check.clone()),
-            checks: None,
-        }
     }
 }
 
@@ -319,6 +298,23 @@ impl From<Node> for CatalogRegistration {
     }
 }
 
+impl From<HealthCheck> for CatalogRegistration {
+    fn from(check: HealthCheck) -> Self {
+        Self {
+            id: check.id.clone(),
+            node: check.node.clone(),
+            address: None,
+            datacenter: None,
+            tagged_addresses: None,
+            node_meta: None,
+            service: None,
+            skip_node_update: Some(true),
+            check: Some(check.clone()),
+            checks: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct NodeStreamState {
     consul: Consul,
@@ -391,42 +387,30 @@ impl NodeStreamState {
                 }
             }
         }
-
-        if let Some(new_node) = added_nodes.pop_front() {
+        let result = if let Some(new_node) = added_nodes.pop_front() {
             self.known_nodes.insert(new_node.clone());
             self.node_versions
                 .insert(new_node.name.clone(), new_node.modify_index);
-
-            self.pending_added_nodes = added_nodes;
-            self.pending_deleted_nodes = deleted_nodes;
-            self.pending_updated_nodes = updated_nodes;
-
-            return Some(NodeEvent::Added(new_node));
-        }
-
-        if let Some(removed_node) = deleted_nodes.pop_front() {
+            Some(NodeEvent::Added(new_node))
+        } else if let Some(removed_node) = deleted_nodes.pop_front() {
             self.known_nodes.remove(&removed_node);
             self.node_versions.remove(&removed_node.name);
-
-            self.pending_added_nodes = added_nodes;
-            self.pending_deleted_nodes = deleted_nodes;
-            self.pending_updated_nodes = updated_nodes;
-            return Some(NodeEvent::Removed(removed_node));
-        }
-
-        if let Some(updated_node) = updated_nodes.pop_front() {
+            Some(NodeEvent::Removed(removed_node))
+        } else if let Some(updated_node) = updated_nodes.pop_front() {
             self.known_nodes.remove(&updated_node);
             self.known_nodes.insert(updated_node.clone());
             self.node_versions
                 .insert(updated_node.name.clone(), updated_node.modify_index);
+            Some(NodeEvent::Updated(updated_node))
+        } else {
+            None
+        };
 
-            self.pending_added_nodes = added_nodes;
-            self.pending_deleted_nodes = deleted_nodes;
-            self.pending_updated_nodes = updated_nodes;
-            return Some(NodeEvent::Updated(updated_node));
-        }
+        self.pending_added_nodes = added_nodes;
+        self.pending_deleted_nodes = deleted_nodes;
+        self.pending_updated_nodes = updated_nodes;
 
-        None
+        result
     }
 
     async fn fetch_nodes_from_consul(&mut self) -> Result<Vec<Node>, NodeEvent> {
@@ -532,39 +516,30 @@ impl HealthCheckStreamState {
                 }
             }
         }
-
-        if let Some(new_check) = added_checks.pop_front() {
+        let result = if let Some(new_check) = added_checks.pop_front() {
             self.known_checks.insert(new_check.clone());
-            self.pending_added_checks = added_checks;
-            self.pending_deleted_checks = deleted_checks;
-            self.pending_updated_checks = updated_checks;
             self.check_versions
                 .insert(new_check.name.clone(), new_check.modify_index);
-            return Some(HealthCheckEvent::Added(new_check));
-        }
-
-        if let Some(removed_check) = deleted_checks.pop_front() {
+            Some(HealthCheckEvent::Added(new_check))
+        } else if let Some(removed_check) = deleted_checks.pop_front() {
             self.known_checks.remove(&removed_check);
             self.check_versions.remove(&removed_check.name);
-            self.pending_added_checks = added_checks;
-            self.pending_deleted_checks = deleted_checks;
-            self.pending_updated_checks = updated_checks;
-            return Some(HealthCheckEvent::Removed(removed_check));
-        }
-
-        if let Some(updated_check) = updated_checks.pop_front() {
+            Some(HealthCheckEvent::Removed(removed_check))
+        } else if let Some(updated_check) = updated_checks.pop_front() {
             self.known_checks.remove(&updated_check);
             self.known_checks.insert(updated_check.clone());
-            self.pending_added_checks = added_checks;
-            self.pending_deleted_checks = deleted_checks;
-            self.pending_updated_checks = updated_checks;
             self.check_versions
                 .insert(updated_check.name.clone(), updated_check.modify_index);
+            Some(HealthCheckEvent::Updated(updated_check))
+        } else {
+            None
+        };
 
-            return Some(HealthCheckEvent::Updated(updated_check));
-        }
+        self.pending_added_checks = added_checks;
+        self.pending_deleted_checks = deleted_checks;
+        self.pending_updated_checks = updated_checks;
 
-        None
+        result
     }
 
     async fn fetch_checks_from_consul(&mut self) -> Result<Vec<HealthCheck>, HealthCheckEvent> {

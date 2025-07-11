@@ -1,3 +1,4 @@
+mod checkers;
 mod consul;
 use clap::Parser;
 
@@ -9,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
-use tracing_subscriber;
+
 const CRITICAL_THRESHOLD: usize = 3; // Number of consecutive failures before marking as critical
 
 struct HealthChecker {
@@ -39,6 +40,7 @@ impl HealthChecker {
         let task = tokio::spawn({
             let consul = consul.clone();
             let mut health_check = health_check.clone();
+
             if health_check.definition.is_none() {
                 error!("Health check definition is None, cannot start task.");
                 return Err(Error::HealthCheckDefinitionMissing);
@@ -55,7 +57,6 @@ impl HealthChecker {
             }
 
             async move {
-                // Simulate health check logic
                 let mut consecutive_times_critical = 0;
                 loop {
                     let definition = health_check.definition.clone();
@@ -65,34 +66,24 @@ impl HealthChecker {
                     }
 
                     let definition = definition.unwrap();
-                    tokio::time::sleep(tokio::time::Duration::from_secs(
-                        definition.interval_in_seconds(),
-                    ))
-                    .await;
+                    let interval = definition.interval_in_seconds();
+
+                    tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
                     match definition.check_type() {
                         consul::CheckType::HTTP => {
                             info!("Running HTTP health check for: {}", health_check.name);
-                            let client = reqwest::Client::builder()
-                                .timeout(std::time::Duration::from_secs(
-                                    definition.timeout_in_seconds(),
-                                )) // set global timeout
-                                .build()
-                                .unwrap();
 
-                            match client.get(definition.http().unwrap()).send().await {
-                                Ok(response) => {
-                                    if response.status().is_success() {
-                                        info!("HTTP check succeeded for: {}", health_check.name);
-                                        health_check.set_status(consul::CheckStatus::Passing);
-                                        consecutive_times_critical = 0;
-                                    } else {
-                                        error!(
-                                            "HTTP check failed with status: {} for: {}",
-                                            response.status(),
-                                            health_check.name
-                                        );
-                                        consecutive_times_critical += 1;
-                                    }
+                            match checkers::HTTPChecker::new(
+                                definition.http().unwrap().to_string(),
+                                definition.timeout_in_seconds(),
+                            )
+                            .check()
+                            .await
+                            {
+                                Ok(_) => {
+                                    debug!("HTTP check succeeded for: {}", health_check.name);
+                                    health_check.set_status(consul::CheckStatus::Passing);
+                                    consecutive_times_critical = 0;
                                 }
                                 Err(e) => {
                                     error!("HTTP check failed: {}", e);
@@ -102,21 +93,17 @@ impl HealthChecker {
                         }
                         consul::CheckType::TCP => {
                             info!("Running TCP health check for: {}", health_check.name);
-                            let addr = definition.tcp().unwrap();
-                            let timeout_duration =
-                                std::time::Duration::from_secs(definition.timeout_in_seconds());
-
-                            match timeout(timeout_duration, tokio::net::TcpStream::connect(addr))
-                                .await
+                            match checkers::TCPChecker::new(
+                                definition.tcp().unwrap().to_string(),
+                                definition.timeout_in_seconds(),
+                            )
+                            .check()
+                            .await
                             {
-                                Ok(Ok(_)) => {
-                                    info!("TCP check succeeded for: {}", health_check.name);
+                                Ok(_) => {
+                                    debug!("TCP check succeeded for: {}", health_check.name);
                                     health_check.set_status(consul::CheckStatus::Passing);
                                     consecutive_times_critical = 0;
-                                }
-                                Ok(Err(e)) => {
-                                    info!("TCP check failed: {}", e);
-                                    consecutive_times_critical += 1;
                                 }
                                 Err(e) => {
                                     error!("TCP check failed: {}", e);
@@ -125,7 +112,7 @@ impl HealthChecker {
                             }
                         }
                         _ => {
-                            error!("Not implemented: Script health checks are not supported yet.");
+                            error!("Not implemented: Health check type supported yet.");
                             break;
                         }
                     }
@@ -136,7 +123,6 @@ impl HealthChecker {
                             "Health check {} failed {} times consecutively, marking as critical.",
                             health_check.name, consecutive_times_critical
                         );
-                        // Here you would typically notify or take action based on the critical state.
                     }
                     match consul.register_node(health_check.clone().into()).await {
                         Ok(_) => {
@@ -279,7 +265,6 @@ impl NodeHealthChecker {
                         } else {
                             info!("Node {} is healthy, no action needed.", node.name.clone());
                         }
-                        // Sleep for a while before checking again
                     }
                 }
             });
