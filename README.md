@@ -1,6 +1,6 @@
 # consul-reaper
 
-`consul-reaper` watches Consul nodes and health checks, runs external probe checks itself, updates Consul with the latest health check status, and emits node-level webhook events when a node transitions between `healthy` and `unhealthy`.
+`consul-reaper` watches Consul nodes and health checks, runs external probe checks itself, updates Consul with the latest health check status, emits node-level webhook events when a node transitions between `healthy` and `unhealthy`, and deregisters nodes that keep failing beyond a configured threshold.
 
 ## What it does
 
@@ -11,6 +11,8 @@ For each matching node in Consul:
 3. writes probe results back to Consul
 4. aggregates all check states for that node
 5. sends a webhook when the node's derived network status changes
+6. sends a delete webhook and cleans up when a node is removed
+7. deregisters a node from Consul if a health check fails more than the configured threshold
 
 The current node webhook payload is:
 
@@ -30,7 +32,15 @@ or:
 }
 ```
 
-The webhook is sent with an HTTP `POST` to `node_event_webhook_url`.
+The status webhook is sent with an HTTP `POST` to `node_event_webhook_url`.
+
+When a node is removed, a delete webhook is sent with an HTTP `DELETE` to the same endpoint using this payload:
+
+```json
+{
+  "node": "node-name"
+}
+```
 
 ---
 
@@ -88,6 +98,7 @@ Responsibility:
 - convert probe results into Consul `CheckStatus`
 - update the check in Consul
 - emit a status event when the check status changes
+- deregister the node from Consul if failures exceed the configured threshold
 
 There is one such task per active health check.
 
@@ -186,21 +197,25 @@ If parsing fails, the Consul helper falls back to its internal default interval.
 
 A check is not marked critical on the first failure.
 
-The runner maintains a consecutive failure counter. Only after:
+The runner maintains a consecutive failure counter. The threshold is configurable with `--delete-threshold` and defaults to:
 
-```rust
-CRITICAL_THRESHOLD = 3
+```text
+3
 ```
-
-does the check status become `critical`.
 
 Behavior:
 
 - success => status becomes `passing`, failure counter resets to `0`
 - failure => failure counter increments
-- after 3 consecutive failures => status becomes `critical`
+- after `delete_threshold` consecutive failures => status becomes `critical`
+- after more than `delete_threshold` consecutive failures => the node is deregistered from Consul
 
-This dampens transient failures.
+With the default value `3`:
+
+- 3 consecutive failures => check becomes `critical`
+- 4 consecutive failures => node is deregistered
+
+This dampens transient failures while still removing persistently failing nodes.
 
 ---
 
@@ -279,6 +294,13 @@ After each probe iteration, the runner calls:
 - `consul.register_node(health_check.clone().into())`
 
 This updates Consul with the latest health check state.
+
+### 3. Deregistering persistently failing nodes
+If a health check keeps failing beyond the configured threshold, the runner calls:
+
+- `consul.deregister_node(health_check.clone().into())`
+
+This removes the node from the Consul catalog. The main node watcher then receives a removal event, stops per-node tasks, and sends the delete webhook.
 
 ---
 
@@ -362,6 +384,13 @@ Imagine a node with two checks:
 - node transitions back to `healthy`
 - webhook is sent once with `network_status=healthy`
 
+### Persistent failure beyond threshold
+- a check reaches the configured threshold and becomes `critical`
+- if failures continue past the threshold, the runner deregisters the node from Consul
+- the node watcher later observes `NodeEvent::Removed`
+- the node-local tasks are stopped
+- a `DELETE` webhook is sent with the node name
+
 ---
 
 ## CLI / environment variables
@@ -379,7 +408,16 @@ http://localhost:8500
 Used in the Consul node filter.
 
 ### `--node-event-webhook-url`
-The URL that receives node status events.
+The URL that receives node status events via `POST` and node deletion events via `DELETE`.
+
+### `--delete-threshold`
+Default:
+
+```text
+3
+```
+
+A check becomes `critical` after this many consecutive failures. If failures continue beyond this value, the node is deregistered from Consul.
 
 Example:
 
@@ -387,7 +425,8 @@ Example:
 cargo run -- \
   --consul-http-addr http://localhost:8500 \
   --wg-network prod-eu \
-  --node-event-webhook-url https://example.com/node-events
+  --node-event-webhook-url https://example.com/node-events \
+  --delete-threshold 3
 ```
 
 ---
@@ -406,7 +445,12 @@ Script-based checks are explicitly unsupported.
 ### 4. Empty check set does not emit a node state
 If all checks disappear, the node aggregator simply keeps waiting and does not send a webhook for an "unknown" or empty state.
 
-### 5. Channel is unbounded
+### 5. Node deletion happens after threshold + 1 failures
+The current behavior is intentionally split:
+- at `delete_threshold` consecutive failures, the check becomes `critical`
+- at `delete_threshold + 1` consecutive failures, the node is deregistered
+
+### 6. Channel is unbounded
 The per-node `mpsc` channel is unbounded. That is simple and effective here, but it is still worth remembering if event volume grows significantly.
 
 ---
@@ -437,5 +481,7 @@ The per-node `mpsc` channel is unbounded. That is simple and effective here, but
 - write status back to Consul
 - aggregate per-node state
 - emit webhooks on transitions
+- deregister persistently failing nodes
+- emit delete webhooks on node removal
 
 The most important design point is that **node status propagation is now event-driven**: health check changes are pushed through Tokio channels and webhooks are emitted immediately when the effective node state changes.

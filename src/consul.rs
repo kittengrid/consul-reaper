@@ -276,6 +276,17 @@ impl From<Node> for CatalogDeregistration {
     }
 }
 
+impl From<HealthCheck> for CatalogDeregistration {
+    fn from(check: HealthCheck) -> Self {
+        Self {
+            node: check.node,
+            datacenter: None,
+            check_id: None,
+            service_id: None,
+        }
+    }
+}
+
 impl From<Node> for CatalogRegistration {
     fn from(node: Node) -> Self {
         Self {

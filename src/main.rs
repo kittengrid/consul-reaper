@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info};
 
-const CRITICAL_THRESHOLD: usize = 3; // Number of consecutive failures before marking as critical
+const DEFAULT_DELETE_THRESHOLD: usize = 3;
 
 async fn perform_health_check<T: HealthChecker>(
     checker: T,
@@ -71,6 +71,7 @@ impl HealthCheckRunner {
         health_check: consul::HealthCheck,
         consul: consul::Consul,
         status_tx: mpsc::UnboundedSender<CheckStatusEvent>,
+        delete_threshold: usize,
     ) -> Result<Self, Error> {
         let task = tokio::spawn({
             let consul = consul.clone();
@@ -136,7 +137,7 @@ impl HealthCheckRunner {
                             break;
                         }
                     }
-                    if consecutive_times_critical >= CRITICAL_THRESHOLD {
+                    if consecutive_times_critical >= delete_threshold {
                         health_check.set_status(consul::CheckStatus::Critical);
 
                         error!(
@@ -144,6 +145,32 @@ impl HealthCheckRunner {
                             health_check.name, consecutive_times_critical
                         );
                     }
+
+                    if consecutive_times_critical > delete_threshold {
+                        error!(
+                            "Health check {} failed more than {} times consecutively, deregistering node.",
+                            health_check.name, delete_threshold
+                        );
+
+                        match consul.deregister_node(health_check.clone().into()).await {
+                            Ok(_) => {
+                                info!(
+                                    "Node for health check {} deregistered successfully.",
+                                    health_check.name
+                                );
+                                break;
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Failed to deregister node for health check {}: {}",
+                                    health_check.name, e
+                                );
+                            }
+                        }
+
+                        continue;
+                    }
+
                     match consul.register_node(health_check.clone().into()).await {
                         Ok(_) => {
                             debug!(
@@ -189,19 +216,40 @@ struct NodeHealthChecker {
     consul: consul::Consul,
     node: consul::Node,
     node_event_webhook_url: String,
+    delete_threshold: usize,
     check_watcher: Option<tokio::task::JoinHandle<()>>,
     node_watcher: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl NodeHealthChecker {
-    fn new(node: consul::Node, consul: consul::Consul, node_event_webhook_url: String) -> Self {
+    fn new(
+        node: consul::Node,
+        consul: consul::Consul,
+        node_event_webhook_url: String,
+        delete_threshold: usize,
+    ) -> Self {
         Self {
             tasks: Arc::new(RwLock::new(HashMap::new())),
             consul,
             node,
             node_event_webhook_url,
+            delete_threshold,
             check_watcher: None,
             node_watcher: None,
+        }
+    }
+
+    async fn stop(&mut self) {
+        for (_, mut health_checker) in self.tasks.write().await.drain() {
+            health_checker.stop();
+        }
+
+        if let Some(check_watcher) = self.check_watcher.take() {
+            check_watcher.abort();
+        }
+
+        if let Some(node_watcher) = self.node_watcher.take() {
+            node_watcher.abort();
         }
     }
 
@@ -213,6 +261,7 @@ impl NodeHealthChecker {
             let check_watcher = tokio::spawn({
                 let tasks = self.tasks.clone();
                 let status_tx = status_tx.clone();
+                let delete_threshold = self.delete_threshold;
 
                 async move {
                     let mut stream = consul.watch_health_checks(&node_name);
@@ -228,6 +277,7 @@ impl NodeHealthChecker {
                                     check.clone(),
                                     consul.clone(),
                                     status_tx.clone(),
+                                    delete_threshold,
                                 ) {
                                     tasks
                                         .write()
@@ -264,6 +314,7 @@ impl NodeHealthChecker {
                                     check.clone(),
                                     consul.clone(),
                                     status_tx.clone(),
+                                    delete_threshold,
                                 ) {
                                     tasks
                                         .write()
@@ -361,6 +412,31 @@ struct Args {
 
     #[arg(long, env)]
     node_event_webhook_url: String,
+
+    #[arg(long, env, default_value_t = DEFAULT_DELETE_THRESHOLD)]
+    delete_threshold: usize,
+}
+
+async fn notify_node_deleted(
+    client: &reqwest::Client,
+    node_event_webhook_url: &str,
+    node_name: &str,
+) {
+    if let Err(e) = client
+        .delete(node_event_webhook_url)
+        .json(&json!({
+            "node": node_name,
+        }))
+        .send()
+        .await
+    {
+        error!(
+            "Failed to notify node deletion webhook for {}: {}",
+            node_name, e
+        );
+    } else {
+        info!("Node deletion webhook notified for {}", node_name);
+    }
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
@@ -378,6 +454,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let node_task = tokio::spawn({
         let consul = consul.clone();
+        let webhook_client = reqwest::Client::new();
 
         async move {
             let mut stream = consul.watch_nodes(
@@ -395,6 +472,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             node.clone(),
                             consul.clone(),
                             args.node_event_webhook_url.clone(),
+                            args.delete_threshold,
                         );
                         node_health_checker.start();
 
@@ -405,6 +483,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     NodeEvent::Removed(node) => {
                         info!("Node removed {:?}", node);
+
+                        if let Some(mut node_health_checker) =
+                            node_health_checkers.write().await.remove(&node.name)
+                        {
+                            node_health_checker.stop().await;
+                        }
+
+                        notify_node_deleted(
+                            &webhook_client,
+                            &args.node_event_webhook_url,
+                            &node.name,
+                        )
+                        .await;
                     }
                     NodeEvent::Updated(node) => {
                         info!("Node updated: {:?}", node);
