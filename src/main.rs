@@ -9,7 +9,7 @@ use serde_json::json;
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info};
 
 const CRITICAL_THRESHOLD: usize = 3; // Number of consecutive failures before marking as critical
