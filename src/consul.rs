@@ -72,8 +72,7 @@ impl PartialEq for Node {
 
 impl Eq for Node {}
 
-#[derive(Debug, Serialize, Clone, Deserialize, PartialEq)]
-#[derive(Default)]
+#[derive(Debug, Serialize, Clone, Deserialize, PartialEq, Default)]
 pub enum CheckStatus {
     #[serde(rename = "passing")]
     #[default]
@@ -85,7 +84,6 @@ pub enum CheckStatus {
     #[serde(rename = "critical")]
     Critical,
 }
-
 
 impl std::fmt::Display for CheckStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -379,9 +377,10 @@ impl NodeStreamState {
         let mut updated_nodes = VecDeque::<Node>::new();
         for node in current_nodes {
             if let Some(version) = self.node_versions.get(&node.name)
-                && version < &node.modify_index {
-                    updated_nodes.push_back(node.clone());
-                }
+                && version < &node.modify_index
+            {
+                updated_nodes.push_back(node.clone());
+            }
         }
         let result = if let Some(new_node) = added_nodes.pop_front() {
             self.known_nodes.insert(new_node.clone());
@@ -427,9 +426,10 @@ impl NodeStreamState {
             .map_err(|e| NodeEvent::Error(e.to_string()))?;
 
         if let Some(index_header) = response.headers().get("X-Consul-Index")
-            && let Ok(index_str) = index_header.to_str() {
-                self.last_index = index_str.to_string();
-            }
+            && let Ok(index_str) = index_header.to_str()
+        {
+            self.last_index = index_str.to_string();
+        }
 
         let response_bytes = response.bytes().await.unwrap_or_default();
         let nodes: Vec<Node> =
@@ -506,9 +506,10 @@ impl HealthCheckStreamState {
         let mut updated_checks = VecDeque::<HealthCheck>::new();
         for check in current_checks {
             if let Some(version) = self.check_versions.get(&check.name)
-                && version < &check.modify_index {
-                    updated_checks.push_back(check.clone());
-                }
+                && version < &check.modify_index
+            {
+                updated_checks.push_back(check.clone());
+            }
         }
         let result = if let Some(new_check) = added_checks.pop_front() {
             self.known_checks.insert(new_check.clone());
@@ -551,9 +552,10 @@ impl HealthCheckStreamState {
             .map_err(|e| HealthCheckEvent::Error(e.to_string()))?;
 
         if let Some(index_header) = response.headers().get("X-Consul-Index")
-            && let Ok(index_str) = index_header.to_str() {
-                self.last_index = index_str.to_string();
-            }
+            && let Ok(index_str) = index_header.to_str()
+        {
+            self.last_index = index_str.to_string();
+        }
 
         let response_bytes = response.bytes().await.unwrap_or_default();
         let checks: Vec<HealthCheck> = serde_json::from_slice(&response_bytes)
