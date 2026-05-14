@@ -160,18 +160,18 @@ struct NodeHealthChecker {
     tasks: Arc<RwLock<HashMap<String, HealthCheckRunner>>>,
     consul: consul::Consul,
     node: consul::Node,
-    deleted_node_webhook_url: String,
+    node_event_webhook_url: String,
     check_watcher: Option<tokio::task::JoinHandle<()>>,
     node_watcher: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl NodeHealthChecker {
-    fn new(node: consul::Node, consul: consul::Consul, critical_node_webhook_url: String) -> Self {
+    fn new(node: consul::Node, consul: consul::Consul, node_event_webhook_url: String) -> Self {
         Self {
             tasks: Arc::new(RwLock::new(HashMap::new())),
             consul,
             node,
-            deleted_node_webhook_url: critical_node_webhook_url,
+            node_event_webhook_url,
             check_watcher: None,
             node_watcher: None,
         }
@@ -251,7 +251,7 @@ impl NodeHealthChecker {
                 let tasks = self.tasks.clone();
                 let node = self.node.clone();
                 let consul = self.consul.clone();
-                let deleted_node_webhook_url = self.deleted_node_webhook_url.clone();
+                let node_event_webhook_url = self.node_event_webhook_url.clone();
 
                 async move {
                     loop {
@@ -267,7 +267,7 @@ impl NodeHealthChecker {
                             }
 
                             if let Err(e) = reqwest::Client::new()
-                                .delete(&deleted_node_webhook_url)
+                                .delete(&node_event_webhook_url)
                                 .json(&json!({
                                     "node": node.name.clone(),
                                 }))
@@ -275,12 +275,12 @@ impl NodeHealthChecker {
                                 .await
                             {
                                 error!(
-                                    "Failed to notify deleted node webhook for {}: {}",
+                                    "Failed to notify node event webhook for {}: {}",
                                     node.name.clone(),
                                     e
                                 );
                             } else {
-                                info!("Deleted node webhook notified for {}", node.name.clone());
+                                info!("Node event webhook notified for {}", node.name.clone());
 
                                 break;
                             }
@@ -307,7 +307,7 @@ struct Args {
     wg_network: String,
 
     #[arg(long, env)]
-    deleted_node_webhook_url: String,
+    node_event_webhook_url: String,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
@@ -341,7 +341,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let mut node_health_checker = NodeHealthChecker::new(
                             node.clone(),
                             consul.clone(),
-                            args.deleted_node_webhook_url.clone(),
+                            args.node_event_webhook_url.clone(),
                         );
                         node_health_checker.start();
 
