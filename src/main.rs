@@ -92,7 +92,7 @@ impl HealthCheckRunner {
 
                     tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
                     match definition.check_type() {
-                        consul::CheckType::HTTP => {
+                        consul::CheckType::Http => {
                             let checker = checkers::HTTPChecker::from(&definition);
                             match perform_health_check(checker, &health_check.name, "HTTP").await {
                                 Ok(_) => {
@@ -104,7 +104,7 @@ impl HealthCheckRunner {
                                 }
                             }
                         }
-                        consul::CheckType::TCP => {
+                        consul::CheckType::Tcp => {
                             let checker = checkers::TCPChecker::from(&definition);
                             match perform_health_check(checker, &health_check.name, "TCP").await {
                                 Ok(_) => {
