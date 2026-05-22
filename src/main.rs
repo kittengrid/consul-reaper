@@ -14,15 +14,12 @@ use tracing::{debug, error, info};
 
 const DEFAULT_DELETE_THRESHOLD: usize = 3;
 
-async fn perform_health_check<T: HealthChecker>(
+async fn perform_health_check<T: HealthChecker + std::fmt::Debug>(
     checker: T,
     health_check_name: &str,
     check_type: &str,
 ) -> Result<(), checkers::HealthCheckError> {
-    info!(
-        "Running {} health check for: {}",
-        check_type, health_check_name
-    );
+    info!("Running health: {:?}", checker);
     match checker.check().await {
         Ok(_) => {
             debug!("{} check succeeded for: {}", check_type, health_check_name);
@@ -41,13 +38,9 @@ struct HealthCheckRunner {
 
 #[derive(Debug, Clone)]
 enum CheckStatusEvent {
-    Upsert {
-        check_name: String,
-        status: consul::CheckStatus,
-    },
-    Removed {
-        check_name: String,
-    },
+    Registered { check: consul::HealthCheck },
+    Upsert { check: consul::HealthCheck },
+    Removed { check: consul::HealthCheck },
 }
 
 use thiserror::Error;
@@ -148,27 +141,9 @@ impl HealthCheckRunner {
 
                     if consecutive_times_critical > delete_threshold {
                         error!(
-                            "Health check {} failed more than {} times consecutively, deregistering node.",
+                            "Health check {} failed more than {} times consecutively, keeping it critical.",
                             health_check.name, delete_threshold
                         );
-
-                        match consul.deregister_node(health_check.clone().into()).await {
-                            Ok(_) => {
-                                info!(
-                                    "Node for health check {} deregistered successfully.",
-                                    health_check.name
-                                );
-                                break;
-                            }
-                            Err(e) => {
-                                error!(
-                                    "Failed to deregister node for health check {}: {}",
-                                    health_check.name, e
-                                );
-                            }
-                        }
-
-                        continue;
                     }
 
                     match consul.register_node(health_check.clone().into()).await {
@@ -180,8 +155,7 @@ impl HealthCheckRunner {
 
                             if last_reported_status.as_ref() != Some(&health_check.status) {
                                 if let Err(e) = status_tx.send(CheckStatusEvent::Upsert {
-                                    check_name: health_check.name.clone(),
-                                    status: health_check.status.clone(),
+                                    check: health_check.clone(),
                                 }) {
                                     error!(
                                         "Failed to send status update for health check {}: {}",
@@ -215,7 +189,7 @@ struct NodeHealthChecker {
     tasks: Arc<RwLock<HashMap<String, HealthCheckRunner>>>,
     consul: consul::Consul,
     node: consul::Node,
-    node_event_webhook_url: String,
+    events_webhook_url: String,
     delete_threshold: usize,
     check_watcher: Option<tokio::task::JoinHandle<()>>,
     node_watcher: Option<tokio::task::JoinHandle<()>>,
@@ -225,14 +199,14 @@ impl NodeHealthChecker {
     fn new(
         node: consul::Node,
         consul: consul::Consul,
-        node_event_webhook_url: String,
+        events_webhook_url: String,
         delete_threshold: usize,
     ) -> Self {
         Self {
             tasks: Arc::new(RwLock::new(HashMap::new())),
             consul,
             node,
-            node_event_webhook_url,
+            events_webhook_url,
             delete_threshold,
             check_watcher: None,
             node_watcher: None,
@@ -268,9 +242,9 @@ impl NodeHealthChecker {
                     while let Some(event) = stream.next().await {
                         match event {
                             HealthCheckEvent::Added(check) => {
-                                let _ = status_tx.send(CheckStatusEvent::Upsert {
-                                    check_name: check.name.clone(),
-                                    status: check.status.clone(),
+                                let check_key = check.key();
+                                let _ = status_tx.send(CheckStatusEvent::Registered {
+                                    check: check.clone(),
                                 });
 
                                 if let Ok(health_checker) = HealthCheckRunner::try_new(
@@ -279,33 +253,29 @@ impl NodeHealthChecker {
                                     status_tx.clone(),
                                     delete_threshold,
                                 ) {
-                                    tasks
-                                        .write()
-                                        .await
-                                        .insert(check.name.clone(), health_checker);
+                                    tasks.write().await.insert(check_key, health_checker);
 
                                     info!("Healthcheck added: {:?}", check);
                                 }
                             }
                             HealthCheckEvent::Removed(check) => {
+                                let check_key = check.key();
                                 if let Some(mut health_checker) =
-                                    tasks.write().await.remove(&check.name)
+                                    tasks.write().await.remove(&check_key)
                                 {
                                     health_checker.stop();
                                 }
 
-                                let _ = status_tx.send(CheckStatusEvent::Removed {
-                                    check_name: check.name.clone(),
-                                });
+                                let _ = status_tx.send(CheckStatusEvent::Removed { check });
                             }
                             HealthCheckEvent::Updated(check) => {
+                                let check_key = check.key();
                                 let _ = status_tx.send(CheckStatusEvent::Upsert {
-                                    check_name: check.name.clone(),
-                                    status: check.status.clone(),
+                                    check: check.clone(),
                                 });
 
                                 if let Some(mut health_checker) =
-                                    tasks.write().await.remove(&check.name)
+                                    tasks.write().await.remove(&check_key)
                                 {
                                     health_checker.stop();
                                 }
@@ -316,10 +286,7 @@ impl NodeHealthChecker {
                                     status_tx.clone(),
                                     delete_threshold,
                                 ) {
-                                    tasks
-                                        .write()
-                                        .await
-                                        .insert(check.name.clone(), health_checker);
+                                    tasks.write().await.insert(check_key, health_checker);
 
                                     info!("Healthcheck updated: {:?}", check);
                                 }
@@ -334,7 +301,8 @@ impl NodeHealthChecker {
 
             let node_watcher = tokio::spawn({
                 let node = self.node.clone();
-                let node_event_webhook_url = self.node_event_webhook_url.clone();
+                let consul = self.consul.clone();
+                let service_webhook_url = webhook_url(&self.events_webhook_url, "service");
 
                 async move {
                     let client = reqwest::Client::new();
@@ -343,13 +311,41 @@ impl NodeHealthChecker {
 
                     while let Some(event) = status_rx.recv().await {
                         match event {
-                            CheckStatusEvent::Upsert { check_name, status } => {
+                            CheckStatusEvent::Registered { check } => {
+                                let check_name = check.key();
+                                info!("health check registered: {}", check_name);
+                                if should_notify_service(&check) {
+                                    notify_service_registered(
+                                        &client,
+                                        &service_webhook_url,
+                                        &check,
+                                    )
+                                    .await;
+                                }
+                                continue;
+                            }
+                            CheckStatusEvent::Upsert { check } => {
+                                let check_name = check.key();
+                                let status = check.status.clone();
                                 info!("health status for: {} is {}", check_name, status);
                                 check_statuses.insert(check_name, status);
+                                if should_notify_service(&check) {
+                                    notify_service_status_changed(
+                                        &client,
+                                        &service_webhook_url,
+                                        &check,
+                                    )
+                                    .await;
+                                }
                             }
-                            CheckStatusEvent::Removed { check_name } => {
+                            CheckStatusEvent::Removed { check } => {
+                                let check_name = check.key();
                                 info!("health check removed: {}", check_name);
                                 check_statuses.remove(&check_name);
+                                if should_notify_service(&check) {
+                                    notify_service_deleted(&client, &service_webhook_url, &check)
+                                        .await;
+                                }
                             }
                         }
 
@@ -371,26 +367,26 @@ impl NodeHealthChecker {
                             continue;
                         }
 
-                        if let Err(e) = client
-                            .post(&node_event_webhook_url)
-                            .json(&json!({
-                                "node": node.name,
-                                "network_status": network_status,
-                            }))
-                            .send()
-                            .await
-                        {
-                            error!(
-                                "Failed to notify node event webhook for {} with status {}: {}",
-                                node.name, network_status, e
-                            );
-                        } else {
-                            info!(
-                                "Node event webhook notified for {} with status {}",
-                                node.name, network_status
-                            );
-                            last_network_status = Some(network_status);
+                        if network_status == "unhealthy" {
+                            match consul.deregister_node(node.clone().into()).await {
+                                Ok(_) => {
+                                    info!(
+                                        "Node {} deregistered because all health checks are critical.",
+                                        node.name
+                                    );
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "Failed to deregister unhealthy node {}: {}",
+                                        node.name, e
+                                    );
+                                    continue;
+                                }
+                            }
                         }
+
+                        info!("Node {} status changed: {}", node.name, network_status);
+                        last_network_status = Some(network_status);
                     }
                 }
             });
@@ -411,19 +407,127 @@ struct Args {
     wg_network: String,
 
     #[arg(long, env)]
-    node_event_webhook_url: String,
+    events_webhook_url: String,
 
     #[arg(long, env, default_value_t = DEFAULT_DELETE_THRESHOLD)]
     delete_threshold: usize,
 }
 
-async fn notify_node_deleted(
+fn webhook_url(base_url: &str, path: &str) -> String {
+    let base_url = base_url.trim_end_matches('/');
+    let base_url = base_url
+        .strip_suffix("/node")
+        .or_else(|| base_url.strip_suffix("/service"))
+        .unwrap_or(base_url);
+
+    format!("{}/{}", base_url, path.trim_start_matches('/'))
+}
+
+fn should_notify_service(check: &consul::HealthCheck) -> bool {
+    check
+        .service_id()
+        .is_some_and(|service_id| !service_id.is_empty())
+        && check
+            .service_meta()
+            .is_some_and(|meta| meta.get("id").is_some_and(|id| !id.is_empty()))
+}
+
+fn network_status_from_check_status(status: &consul::CheckStatus) -> &'static str {
+    match status {
+        consul::CheckStatus::Passing => "healthy",
+        consul::CheckStatus::Warning | consul::CheckStatus::Critical => "unhealthy",
+    }
+}
+
+fn service_payload(check: &consul::HealthCheck, network_status: &str) -> serde_json::Value {
+    json!({
+        "node": check.node(),
+        "check": {
+            "id": check.key(),
+            "name": check.name.clone(),
+            "status": check.status.clone(),
+        },
+        "network_status": network_status,
+        "service": {
+            "id": check.service_id(),
+            "name": check.service_name(),
+            "meta": check.service_meta(),
+        }
+    })
+}
+
+async fn notify_service_registered(
     client: &reqwest::Client,
-    node_event_webhook_url: &str,
-    node_name: &str,
+    service_webhook_url: &str,
+    check: &consul::HealthCheck,
 ) {
     if let Err(e) = client
-        .delete(node_event_webhook_url)
+        .patch(service_webhook_url)
+        .json(&service_payload(check, "registered"))
+        .send()
+        .await
+    {
+        error!(
+            "Failed to notify service registration webhook for {}: {}",
+            check.key(),
+            e
+        );
+    } else {
+        info!("Service registration webhook notified for {}", check.key());
+    }
+}
+
+async fn notify_service_status_changed(
+    client: &reqwest::Client,
+    service_webhook_url: &str,
+    check: &consul::HealthCheck,
+) {
+    if let Err(e) = client
+        .patch(service_webhook_url)
+        .json(&service_payload(
+            check,
+            network_status_from_check_status(&check.status),
+        ))
+        .send()
+        .await
+    {
+        error!(
+            "Failed to notify service status webhook for {}: {}",
+            check.key(),
+            e
+        );
+    } else {
+        info!("Service status webhook notified for {}", check.key());
+    }
+}
+
+async fn notify_service_deleted(
+    client: &reqwest::Client,
+    service_webhook_url: &str,
+    check: &consul::HealthCheck,
+) {
+    if let Err(e) = client
+        .delete(service_webhook_url)
+        .json(&service_payload(
+            check,
+            network_status_from_check_status(&check.status),
+        ))
+        .send()
+        .await
+    {
+        error!(
+            "Failed to notify service deletion webhook for {}: {}",
+            check.key(),
+            e
+        );
+    } else {
+        info!("Service deletion webhook notified for {}", check.key());
+    }
+}
+
+async fn notify_node_deleted(client: &reqwest::Client, node_webhook_url: &str, node_name: &str) {
+    if let Err(e) = client
+        .delete(node_webhook_url)
         .json(&json!({
             "node": node_name,
         }))
@@ -471,7 +575,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let mut node_health_checker = NodeHealthChecker::new(
                             node.clone(),
                             consul.clone(),
-                            args.node_event_webhook_url.clone(),
+                            args.events_webhook_url.clone(),
                             args.delete_threshold,
                         );
                         node_health_checker.start();
@@ -492,7 +596,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         notify_node_deleted(
                             &webhook_client,
-                            &args.node_event_webhook_url,
+                            &webhook_url(&args.events_webhook_url, "node"),
                             &node.name,
                         )
                         .await;

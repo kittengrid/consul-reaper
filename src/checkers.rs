@@ -8,6 +8,7 @@ pub trait HealthChecker {
     async fn check(&self) -> Result<(), HealthCheckError>;
 }
 
+#[derive(Debug, Clone)]
 pub struct TCPChecker {
     address: String,
     timeout: u64,
@@ -54,6 +55,7 @@ impl HealthChecker for TCPChecker {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct HTTPChecker {
     address: String,
     timeout: u64,

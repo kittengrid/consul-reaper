@@ -1,6 +1,6 @@
 use futures::stream::{self, Stream};
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -10,6 +10,7 @@ use tokio::sync::Mutex;
 use std::pin::Pin;
 use std::time::Duration;
 use tokio::time::sleep;
+use tracing::{debug, trace};
 
 #[derive(Debug, Clone)]
 pub struct Consul {
@@ -155,6 +156,46 @@ impl CheckDefinition {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct CatalogNodeServices {
+    #[serde(rename = "Services", default)]
+    services: Vec<CatalogNodeService>,
+}
+
+fn deserialize_optional_string_map<'de, D>(
+    deserializer: D,
+) -> Result<Option<HashMap<String, String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    match value {
+        serde_json::Value::Object(_) => serde_json::from_value(value)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Array(values) if values.is_empty() => Ok(None),
+        _ => Ok(None),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CatalogNodeService {
+    #[serde(rename = "ID")]
+    id: String,
+
+    #[serde(
+        rename = "Meta",
+        default,
+        deserialize_with = "deserialize_optional_string_map"
+    )]
+    meta: Option<HashMap<String, String>>,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct HealthCheck {
     #[serde(rename = "ID", skip_serializing_if = "Option::is_none")]
@@ -190,6 +231,9 @@ pub struct HealthCheck {
     #[serde(rename = "ServiceTags", skip_serializing_if = "Option::is_none")]
     service_tags: Option<Vec<String>>,
 
+    #[serde(rename = "ServiceMeta", skip_serializing)]
+    service_meta: Option<HashMap<String, String>>,
+
     #[serde(rename = "Namespace", skip_serializing_if = "Option::is_none")]
     namespace: Option<String>,
 
@@ -199,19 +243,47 @@ pub struct HealthCheck {
 
 impl std::hash::Hash for HealthCheck {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.name.hash(state);
+        self.key().hash(state);
     }
 }
 
 impl PartialEq for HealthCheck {
     fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
+        self.key() == other.key()
     }
 }
 
 impl Eq for HealthCheck {}
 
 impl HealthCheck {
+    pub fn key(&self) -> String {
+        self.check_id
+            .as_deref()
+            .or(self.id.as_deref())
+            .unwrap_or(&self.name)
+            .to_string()
+    }
+
+    pub fn node(&self) -> &str {
+        &self.node
+    }
+
+    pub fn service_id(&self) -> Option<&str> {
+        self.service_id.as_deref()
+    }
+
+    pub fn service_name(&self) -> Option<&str> {
+        self.service_name.as_deref()
+    }
+
+    pub fn service_meta(&self) -> Option<&HashMap<String, String>> {
+        self.service_meta.as_ref()
+    }
+
+    pub fn set_service_meta(&mut self, service_meta: HashMap<String, String>) {
+        self.service_meta = Some(service_meta);
+    }
+
     pub fn set_status(&mut self, status: CheckStatus) {
         self.status = status;
     }
@@ -420,6 +492,13 @@ impl NodeStreamState {
     }
 
     async fn fetch_nodes_from_consul(&mut self) -> Result<Vec<Node>, NodeEvent> {
+        debug!(
+            path = "/v1/catalog/nodes",
+            wait = "5s",
+            index = %self.last_index,
+            filter = %self.filter,
+            "Consul GET"
+        );
         let response = self
             .consul
             .get("/v1/catalog/nodes?{}")
@@ -442,9 +521,17 @@ impl NodeStreamState {
             self.last_index = index_str.to_string();
         }
 
+        let status = response.status();
         let response_bytes = response.bytes().await.unwrap_or_default();
+        trace!(
+            path = "/v1/catalog/nodes",
+            status = %status,
+            body = %String::from_utf8_lossy(&response_bytes),
+            "Consul response"
+        );
         let nodes: Vec<Node> =
             serde_json::from_slice(&response_bytes).map_err(|e| NodeEvent::Error(e.to_string()))?;
+        debug!(count = nodes.len(), "Fetched Consul nodes");
 
         Ok(nodes)
     }
@@ -479,22 +566,20 @@ impl HealthCheckStreamState {
     fn handle_pending_checks(&mut self) -> Option<HealthCheckEvent> {
         if let Some(check) = self.pending_added_checks.pop_front() {
             self.known_checks.insert(check.clone());
-            self.check_versions
-                .insert(check.name.clone(), check.modify_index);
+            self.check_versions.insert(check.key(), check.modify_index);
 
             return Some(HealthCheckEvent::Added(check));
         }
         if let Some(check) = self.pending_deleted_checks.pop_front() {
             self.known_checks.remove(&check);
-            self.check_versions.remove(&check.name);
+            self.check_versions.remove(&check.key());
 
             return Some(HealthCheckEvent::Removed(check));
         }
         if let Some(check) = self.pending_updated_checks.pop_front() {
             self.known_checks.remove(&check);
             self.known_checks.insert(check.clone());
-            self.check_versions
-                .insert(check.name.clone(), check.modify_index);
+            self.check_versions.insert(check.key(), check.modify_index);
             return Some(HealthCheckEvent::Updated(check));
         }
         None
@@ -516,7 +601,7 @@ impl HealthCheckStreamState {
 
         let mut updated_checks = VecDeque::<HealthCheck>::new();
         for check in current_checks {
-            if let Some(version) = self.check_versions.get(&check.name)
+            if let Some(version) = self.check_versions.get(&check.key())
                 && version < &check.modify_index
             {
                 updated_checks.push_back(check.clone());
@@ -525,17 +610,17 @@ impl HealthCheckStreamState {
         let result = if let Some(new_check) = added_checks.pop_front() {
             self.known_checks.insert(new_check.clone());
             self.check_versions
-                .insert(new_check.name.clone(), new_check.modify_index);
+                .insert(new_check.key(), new_check.modify_index);
             Some(HealthCheckEvent::Added(new_check))
         } else if let Some(removed_check) = deleted_checks.pop_front() {
             self.known_checks.remove(&removed_check);
-            self.check_versions.remove(&removed_check.name);
+            self.check_versions.remove(&removed_check.key());
             Some(HealthCheckEvent::Removed(removed_check))
         } else if let Some(updated_check) = updated_checks.pop_front() {
             self.known_checks.remove(&updated_check);
             self.known_checks.insert(updated_check.clone());
             self.check_versions
-                .insert(updated_check.name.clone(), updated_check.modify_index);
+                .insert(updated_check.key(), updated_check.modify_index);
             Some(HealthCheckEvent::Updated(updated_check))
         } else {
             None
@@ -550,6 +635,12 @@ impl HealthCheckStreamState {
 
     async fn fetch_checks_from_consul(&mut self) -> Result<Vec<HealthCheck>, HealthCheckEvent> {
         let url = format!("/v1/health/node/{}", self.node_name);
+        debug!(
+            path = %url,
+            wait = "5s",
+            index = %self.last_index,
+            "Consul GET"
+        );
         let response = self
             .consul
             .get(&url)
@@ -568,11 +659,81 @@ impl HealthCheckStreamState {
             self.last_index = index_str.to_string();
         }
 
+        let status = response.status();
         let response_bytes = response.bytes().await.unwrap_or_default();
-        let checks: Vec<HealthCheck> = serde_json::from_slice(&response_bytes)
+        trace!(
+            path = %url,
+            status = %status,
+            body = %String::from_utf8_lossy(&response_bytes),
+            "Consul response"
+        );
+        let mut checks: Vec<HealthCheck> = serde_json::from_slice(&response_bytes)
             .map_err(|e| HealthCheckEvent::Error(e.to_string()))?;
+        debug!(node = %self.node_name, count = checks.len(), "Fetched Consul health checks");
+
+        if let Err(e) = self.enrich_checks_with_service_meta(&mut checks).await {
+            eprintln!(
+                "Failed to fetch service metadata for node {}: {}",
+                self.node_name, e
+            );
+        }
 
         Ok(checks)
+    }
+
+    async fn enrich_checks_with_service_meta(
+        &self,
+        checks: &mut [HealthCheck],
+    ) -> Result<(), String> {
+        let service_meta_by_id = self.fetch_service_meta_from_consul().await?;
+
+        for check in checks {
+            let Some(service_id) = check.service_id().map(str::to_string) else {
+                continue;
+            };
+
+            if let Some(service_meta) = service_meta_by_id.get(&service_id) {
+                check.set_service_meta(service_meta.clone());
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn fetch_service_meta_from_consul(
+        &self,
+    ) -> Result<HashMap<String, HashMap<String, String>>, String> {
+        let url = format!("/v1/catalog/node-services/{}", self.node_name);
+        debug!(path = %url, "Consul GET");
+        let response = self
+            .consul
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("Consul returned {}: {}", status, body));
+        }
+
+        let status = response.status();
+        let response_bytes = response.bytes().await.map_err(|e| e.to_string())?;
+        trace!(
+            path = %url,
+            status = %status,
+            body = %String::from_utf8_lossy(&response_bytes),
+            "Consul response"
+        );
+        let node_services: CatalogNodeServices =
+            serde_json::from_slice(&response_bytes).map_err(|e| e.to_string())?;
+
+        Ok(node_services
+            .services
+            .into_iter()
+            .filter_map(|service| service.meta.map(|meta| (service.id, meta)))
+            .collect())
     }
 }
 
@@ -682,11 +843,13 @@ impl Consul {
         &self,
         registration: CatalogDeregistration,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        debug!(path = "/v1/catalog/deregister", registration = ?registration, "Consul PUT");
         let response = self
             .put("/v1/catalog/deregister")
             .json(&registration)
             .send()
             .await?;
+        debug!(path = "/v1/catalog/deregister", status = %response.status(), "Consul response");
 
         if !response.status().is_success() {
             let body = response.text().await?;
@@ -703,11 +866,13 @@ impl Consul {
         &self,
         registration: CatalogRegistration,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        debug!(path = "/v1/catalog/register", registration = ?registration, "Consul PUT");
         let response = self
             .put("/v1/catalog/register")
             .json(&registration)
             .send()
             .await?;
+        debug!(path = "/v1/catalog/register", status = %response.status(), "Consul response");
 
         if !response.status().is_success() {
             let body = response.text().await?;
@@ -728,6 +893,7 @@ impl Consul {
         } else {
             format!("http://{}:{}{}", self.host, self.port, url)
         };
+        debug!(method = "PUT", url = %full_url, "Building Consul request");
         self.client.put(full_url)
     }
 
@@ -737,6 +903,7 @@ impl Consul {
         } else {
             format!("http://{}:{}{}", self.host, self.port, url)
         };
+        debug!(method = "GET", url = %full_url, "Building Consul request");
         self.client.get(full_url)
     }
 }
