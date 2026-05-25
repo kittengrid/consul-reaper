@@ -1,9 +1,9 @@
-mod checkers;
-mod consul;
 use clap::Parser;
 
-use checkers::HealthChecker;
-use consul::{HealthCheckEvent, NodeEvent};
+use consul_reaper::checkers;
+use consul_reaper::checkers::HealthChecker;
+use consul_reaper::consul;
+use consul_reaper::consul::{HealthCheckEvent, NodeEvent};
 use serde_json::json;
 
 use futures::StreamExt;

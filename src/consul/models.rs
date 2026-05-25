@@ -56,6 +56,16 @@ impl PartialEq for Node {
 
 impl Eq for Node {}
 
+impl Node {
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    pub fn node_meta(&self) -> Option<&HashMap<String, String>> {
+        self.node_meta.as_ref()
+    }
+}
+
 #[derive(Debug, Serialize, Clone, Deserialize, PartialEq, Default)]
 pub enum CheckStatus {
     #[serde(rename = "passing")]
