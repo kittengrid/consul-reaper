@@ -1,9 +1,9 @@
-mod checkers;
-mod consul;
 use clap::Parser;
 
-use checkers::HealthChecker;
-use consul::{HealthCheckEvent, NodeEvent};
+use consul_reaper::checkers;
+use consul_reaper::checkers::HealthChecker;
+use consul_reaper::consul;
+use consul_reaper::consul::{HealthCheckEvent, NodeEvent};
 use serde_json::json;
 
 use futures::StreamExt;
@@ -110,6 +110,9 @@ impl HealthCheckRunner {
                                 }
                                 Err(_) => {
                                     consecutive_times_critical += 1;
+                                    if consecutive_times_critical < delete_threshold {
+                                        health_check.set_status(consul::CheckStatus::Warning);
+                                    }
                                 }
                             }
                         }
@@ -122,6 +125,9 @@ impl HealthCheckRunner {
                                 }
                                 Err(_) => {
                                     consecutive_times_critical += 1;
+                                    if consecutive_times_critical < delete_threshold {
+                                        health_check.set_status(consul::CheckStatus::Warning);
+                                    }
                                 }
                             }
                         }
