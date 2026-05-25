@@ -1,4 +1,9 @@
-use consul_reaper::consul::{Consul, HealthCheckEvent, Node, NodeEvent};
+mod consul;
+
+use consul::{
+    TestCheckDefinition, TestHealthCheck, TestServiceRegistration, register_node_service_for_test,
+};
+use consul_reaper::consul::{CheckStatus, Consul, HealthCheckEvent, Node, NodeEvent};
 use futures::StreamExt;
 use serde_json::json;
 use std::collections::HashMap;
@@ -272,45 +277,33 @@ async fn test_watch_health_checks() {
         }
     });
 
-    let catalog_registration = json!({
-        "Node": node.name,
-        "Address": node.address(),
-        "Service": {
-            "ID": "web1",
-            "Service": "web",
-            "Port": 8080,
-            "Tags": ["http", "api"],
-            "Meta": {
-               "label": "test",
-            },
+    register_node_service_for_test(
+        "http://localhost:8500",
+        &node,
+        TestServiceRegistration {
+            id: Some("web1".to_string()),
+            name: "web".to_string(),
+            port: 8080,
+            tags: Some(vec!["http".to_string(), "api".to_string()]),
+            meta: Some(HashMap::from([("label".to_string(), "test".to_string())])),
+            checks: vec![TestHealthCheck {
+                name: "web-check".to_string(),
+                check_id: Some("web".to_string()),
+                status: CheckStatus::Passing,
+                service_id: Some("web1".to_string()),
+                notes: Some("Web service check".to_string()),
+                output: Some("Web service is healthy".to_string()),
+                definition: Some(TestCheckDefinition {
+                    interval: Some("10s".to_string()),
+                    timeout: Some("5s".to_string()),
+                    http: Some(format!("http://{}:8080/health", node.address())),
+                    tcp: None,
+                }),
+            }],
         },
-        "Checks": [
-            {
-                "Name": "web-check",
-                "CheckID": "web",
-                "Status": "passing",
-                "ServiceID": "web1",
-                "Notes": "Web service check",
-                "Output": "Web service is healthy",
-                "Definition": {
-                    "Interval": "10s",
-                    "Timeout": "5s",
-                    "HTTP": format!("http://{}:8080/health", node.address())
-                }
-            }
-        ]
-    });
-
-    let response = reqwest::Client::new()
-        .put("http://localhost:8500/v1/catalog/register")
-        .json(&catalog_registration)
-        .send()
-        .await
-        .unwrap();
-    trace!("Catalog registration response: {:?}", response);
-    trace!("Response status: {}", response.status());
-
-    assert!(response.status().is_success());
+    )
+    .await
+    .unwrap();
 
     task.await.unwrap();
 }

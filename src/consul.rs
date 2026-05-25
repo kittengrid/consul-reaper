@@ -649,6 +649,7 @@ mod tests {
             service: "web".to_string(),
             port: 8080,
             tags: Some(vec!["http".to_string(), "api".to_string()]),
+            meta: None,
         });
 
         let result = consul.register_node(registration).await;
@@ -664,6 +665,7 @@ mod tests {
             service: "web".to_string(),
             port: 8080,
             tags: Some(vec!["http".to_string(), "api".to_string()]),
+            meta: None,
         });
 
         assert_eq!(registration.node, "test-node");

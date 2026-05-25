@@ -17,6 +17,9 @@ pub(crate) struct ServiceDefinition {
 
     #[serde(rename = "Tags", skip_serializing_if = "Option::is_none")]
     pub(crate) tags: Option<Vec<String>>,
+
+    #[serde(rename = "Meta", skip_serializing_if = "Option::is_none")]
+    pub(crate) meta: Option<HashMap<String, String>>,
 }
 
 #[derive(Default, Debug, Deserialize, Clone)]
