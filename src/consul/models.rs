@@ -152,7 +152,7 @@ impl CheckDefinition {
 #[derive(Debug, Deserialize)]
 pub(crate) struct CatalogNodeServices {
     #[serde(rename = "Services", default)]
-    pub(crate) services: Vec<CatalogNodeService>,
+    pub(crate) services: Option<Vec<CatalogNodeService>>,
 }
 
 fn deserialize_optional_string_map<'de, D>(

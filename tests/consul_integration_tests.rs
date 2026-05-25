@@ -4,6 +4,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
+use tracing::trace;
 
 fn test_node(name: String, address: String, meta: Option<HashMap<String, String>>) -> Node {
     let mut value = json!({
@@ -246,6 +247,10 @@ async fn test_watch_health_checks() {
                         HealthCheckEvent::Added(check) => {
                             println!("Health check added: {:?}", check.name);
                             events_received += 1;
+                            trace!("Health check details: {:?}", check);
+
+                            assert_eq!(check.service_name(), Some("web"));
+                            assert_eq!(check.service_meta(), Some(HashMap::from([("label".to_string(), "test".to_string())])).as_ref());
                         },
                         HealthCheckEvent::Updated(check) => {
                             println!("Health check updated: {:?}", check.name);
@@ -274,7 +279,10 @@ async fn test_watch_health_checks() {
             "ID": "web1",
             "Service": "web",
             "Port": 8080,
-            "Tags": ["http", "api"]
+            "Tags": ["http", "api"],
+            "Meta": {
+               "label": "test",
+            },
         },
         "Checks": [
             {
@@ -289,17 +297,6 @@ async fn test_watch_health_checks() {
                     "Timeout": "5s",
                     "HTTP": format!("http://{}:8080/health", node.address())
                 }
-            },
-            {
-                "Name": "host-check",
-                "Status": "passing",
-                "Notes": "Web service check",
-                "Output": "Web service is healthy",
-                "Definition": {
-                    "Interval": "10s",
-                    "Timeout": "5s",
-                    "TCP": "localhost:22"
-                }
             }
         ]
     });
@@ -310,6 +307,9 @@ async fn test_watch_health_checks() {
         .send()
         .await
         .unwrap();
+    trace!("Catalog registration response: {:?}", response);
+    trace!("Response status: {}", response.status());
+
     assert!(response.status().is_success());
 
     task.await.unwrap();

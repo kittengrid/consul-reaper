@@ -365,6 +365,7 @@ impl HealthCheckStreamState {
 
         Ok(node_services
             .services
+            .unwrap_or_default()
             .into_iter()
             .filter_map(|service| service.meta.map(|meta| (service.id, meta)))
             .collect())
