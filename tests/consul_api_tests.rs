@@ -22,7 +22,7 @@ async fn test_register_node_service_for_test_request_body() {
     let mut server = Server::new_async().await;
     let _m = server
         .mock("PUT", "/v1/catalog/register")
-        .match_body(mockito::Matcher::JsonString(r#"{"Node":"test-node","Address":"192.168.1.100","Service":{"ID":"web1","Service":"web","Port":8080,"Tags":["http","api"],"Meta":{"label":"test"}},"Checks":[{"Name":"web-check","CheckID":"web","Status":"passing","ServiceID":"web1","Notes":"Web service check","Output":"Web service is healthy","Definition":{"Interval":"10s","Timeout":"5s","HTTP":"http://192.168.1.100:8080/health"}}]}"#.to_string()))
+        .match_body(mockito::Matcher::JsonString(r#"{"Node":"test-node","Address":"192.168.1.100","Service":{"ID":"web1","Service":"web","Port":8080,"Tags":["http","api"],"Meta":{"label":"test"}},"SkipNodeUpdate":true,"Checks":[{"Name":"web-check","CheckID":"web","Status":"passing","ServiceID":"web1","Notes":"Web service check","Output":"Web service is healthy","Definition":{"Interval":"10s","Timeout":"5s","HTTP":"http://192.168.1.100:8080/health"}}]}"#.to_string()))
         .with_status(200)
         .with_body("true")
         .create();

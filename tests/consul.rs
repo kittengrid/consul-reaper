@@ -42,6 +42,9 @@ struct CatalogRegistrationPayload {
     #[serde(rename = "Service")]
     service: ServicePayload,
 
+    #[serde(rename = "SkipNodeUpdate")]
+    skip_node_update: bool,
+
     #[serde(rename = "Checks", skip_serializing_if = "Vec::is_empty")]
     checks: Vec<HealthCheckPayload>,
 }
@@ -103,6 +106,32 @@ struct CheckDefinitionPayload {
     tcp: Option<String>,
 }
 
+#[allow(dead_code)]
+pub async fn register_node_for_test(
+    consul_http_addr: &str,
+    node: &Node,
+    node_meta: HashMap<String, String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let payload = serde_json::json!({
+        "Node": node.name,
+        "Address": node.address(),
+        "NodeMeta": node_meta,
+    });
+
+    let response = reqwest::Client::new()
+        .put(format!("{}/v1/catalog/register", consul_http_addr))
+        .json(&payload)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let body = response.text().await?;
+        return Err(format!("Failed to register node: {}", body).into());
+    }
+
+    Ok(())
+}
+
 pub async fn register_node_service_for_test(
     consul_http_addr: &str,
     node: &Node,
@@ -119,6 +148,7 @@ pub async fn register_node_service_for_test(
             tags: service.tags,
             meta: service.meta,
         },
+        skip_node_update: true,
         checks: service
             .checks
             .into_iter()
